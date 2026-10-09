@@ -16,6 +16,10 @@ let loadController = null;
 // Incremented on every navigation (hash change). A create/delete records it when it starts and
 // may only update the page if no navigation happened while it was in flight (see stillOn()).
 let navSeq = 0;
+// Create/delete outcomes ({ text, isError }) in this folder whose reload is still running. A newer
+// reload in the same folder makes an older one stale, so whichever reload finishes last reports them
+// all. Cleared on navigation (D16); a dropped partial-delete warning is alerted instead.
+let pendingReports = [];
 
 function navigationToken() {
   const token = navSeq;
@@ -192,13 +196,21 @@ async function load() {
   }
 }
 
-// After a successful create/delete, reloads the folder and reports `done` (e.g. 'Created folder "x"')
-// without hiding a failed reload. Reports nothing if the user navigated meanwhile.
-async function reloadAndReport(nav, done) {
+// After a create/delete, reloads the folder and reports `text` (a sentence, e.g. 'Created folder "x".')
+// without hiding a failed reload. If a newer reload supersedes this one, that reload reports `text`
+// too. Reports nothing in the status if the user navigated meanwhile (a dropped warning is alerted
+// by the hashchange handler, see D16).
+async function reloadAndReport(nav, text, isError = false) {
+  pendingReports.push({ text, isError });
   const reload = await load();
   if (!nav.stillOn() || reload.stale) return;
-  if (reload.ok) setStatus(`${done}.`);
-  else setStatus(`${done}, but the folder could not be reloaded: ${reload.message}`, true);
+  const reports = pendingReports;
+  pendingReports = [];
+  const joined = reports.map((r) => r.text).join(' ');
+  const anyError = reports.some((r) => r.isError);
+  if (reload.ok) setStatus(joined, anyError);
+  else if (anyError) setStatus(`${joined} The folder could not be reloaded: ${reload.message}`, true);
+  else setStatus(`${joined.slice(0, -1)}, but the folder could not be reloaded: ${reload.message}`, true);
 }
 
 async function createFolder(event) {
@@ -214,7 +226,7 @@ async function createFolder(event) {
     await api('POST', '/api/folders', { path: `${current.prefix}${name}/` });
     if (!nav.stillOn()) return; // the user has moved on; leave the new folder's page alone
     els.newFolderName.value = '';
-    await reloadAndReport(nav, `Created folder "${name}"`);
+    await reloadAndReport(nav, `Created folder "${name}".`);
   } catch (err) {
     if (!nav.stillOn()) return;
     setStatus(err.message, true);
@@ -244,7 +256,7 @@ async function deleteFolder(folder) {
       await api('DELETE', `${url}&recursive=true&confirm=${encodeURIComponent(typed)}`);
     }
     if (!nav.stillOn()) return;
-    await reloadAndReport(nav, `Deleted folder "${folder.name}"`);
+    await reloadAndReport(nav, `Deleted folder "${folder.name}".`);
   } catch (err) {
     if (err.code === 'DELETE_INCOMPLETE') {
       const d = err.details ?? {};
@@ -256,13 +268,7 @@ async function deleteFolder(folder) {
         alert(message);
         return;
       }
-      const reload = await load(); // show what actually remains
-      if (!nav.stillOn()) {
-        alert(message);
-        return;
-      }
-      const reloadNote = reload.ok || reload.stale ? '' : ` The folder could not be reloaded: ${reload.message}`;
-      setStatus(message + reloadNote, true);
+      await reloadAndReport(nav, message, true); // show what actually remains, and keep the warning
       return;
     }
     if (!nav.stillOn()) return;
@@ -274,6 +280,10 @@ els.newFolderForm.addEventListener('submit', createFolder);
 els.sort.addEventListener('change', renderListing);
 window.addEventListener('hashchange', () => {
   navSeq += 1;
+  const dropped = pendingReports;
+  pendingReports = [];
   load();
+  // Possible data loss must not go unreported, but the new folder's status isn't ours to change.
+  for (const report of dropped) if (report.isError) alert(report.text);
 });
 load();

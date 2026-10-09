@@ -30,8 +30,9 @@ Status: direction approved by Mr. So on 2026-10-08.
 | D14 | Browser regression tests drive headless Chrome via the DevTools Protocol with Node's built-in WebSocket (`test/helpers/chrome.js`): no new dependencies. Skipped with a reason if no Chrome is found. The helper bounds startup, shutdown (SIGTERM, then SIGKILL of the process group), CDP commands and navigation; cleanup is idempotent; pending commands fail when the connection drops (second review, 2026-10-08). |
 | D15 | Breadcrumb links, folder links and buttons are at least 44×44 CSS px (review finding 4). |
 | D16 | Create/delete completions are discarded if the user navigated while they were in flight (navigation sequence token): they never change the new folder's status, and a delete never prompts about a folder the user has left. Exception: a partial delete is still reported, via `alert()`, because it means possible data loss (second review). |
-| D18 | M1 closure fixes N1–N4 from the fresh Claude review (`docs/CLAUDE_REVIEW.md`), approved by Mr. So on 2026-10-09: startup logs "listening" only after a successful bind; the URL hash is kept canonical (an undecodable hash becomes `#/` via `history.replaceState`, so there is no loop and no new history entry); a failed reload after a successful create/delete is reported together with the success, never hidden by it; automated browser coverage for all six sort orders, folders first, and toolbar controls ≥ 44×44. Operations finishing after navigation keep D16 unchanged (no notice area; partial delete stays an alert). |
 | D17 | Storage failures are reported to clients only as fixed reasons (`ACCESS_DENIED`, `CREDENTIALS_UNAVAILABLE`, `BUCKET_NOT_FOUND`, `THROTTLED`, `NETWORK`, `UNAVAILABLE`, `UNKNOWN`) in 502 `STORAGE_ERROR` / `DELETE_INCOMPLETE`. Raw SDK names, S3 codes and messages are logged server-side only (second review). |
+| D18 | M1 closure fixes N1–N4 from the fresh Claude review (`docs/CLAUDE_REVIEW.md`), approved by Mr. So on 2026-10-09: startup logs "listening" only after a successful bind; the URL hash is kept canonical (an undecodable hash becomes `#/` via `history.replaceState`, so there is no loop and no new history entry); a failed reload after a successful create/delete is reported together with the success, never hidden by it; automated browser coverage for all six sort orders, folders first, and toolbar controls ≥ 44×44. Operations finishing after navigation keep D16 unchanged (no notice area; partial delete stays an alert). |
+| D19 | On 2026-10-09 Mr. So delegated acceptance to Eve and approved fixing all four remaining non-blocking M1 review findings, then proceeding to M2 without his manual review. M1 must still pass a fresh independent read-only Claude review and Eve's deterministic gates before M2 starts. No deployment or real-S3 action is authorized. |
 
 ## 3. Architecture
 ```
@@ -86,10 +87,21 @@ Errors: `{ "error": { "code": "...", "message": "...", "details"?: {...} } }` wi
   - N2: an undecodable or non-canonical hash is replaced in place by the canonical URL; no navigation loop
   - N3: a failed reload after create/delete (including partial delete) is reported, not overwritten
   - N4: all six sort orders and folders-first; toolbar controls ≥ 44×44 CSS px at 375 px and 1280 px
+- Final M1 closure (D19), each with a regression test where behavior changes:
+  - reject structured/non-string query values such as `prefix[a]=b` with 400, consistently with repeated values
+  - non-recursive folder deletion must determine non-emptiness with a bounded listing (at most the marker plus one child), not enumerate the entire prefix
+  - when two same-folder mutations overlap, each successful mutation must retain a user-visible outcome even if its reload becomes stale; D16 still forbids notices after navigation
+  - keep decision numbering in order in this document
 
 **M2 – File operations**
 - Upload (multi-file, progress), download, rename/move, delete
 - Tests: upload/download round trip, oversize → 413, rename, delete, bad keys → 400
+- Uploads are streamed through the server and bounded by `MAX_UPLOAD_MB` (default 100); partial multi-file failures must be reported per file without claiming failed files succeeded.
+- Download returns a short-lived presigned GET redirect from real S3; the memory/demo driver must provide a deterministic local download response so automated API/browser tests never touch AWS.
+- Rename/move is copy-then-delete for S3. It must reject a missing source and an existing destination, never delete the source when copy fails, and report a partial move if copy succeeds but source deletion fails.
+- Delete file requires an explicit browser confirmation and exact server-side key validation.
+- UI requirements: multi-file picker, per-file progress/result, file-row Download/Rename/Delete actions, phone-width usability, stale async outcomes must not overwrite the status of a folder navigated to later, and touch targets remain at least 44×44 CSS px.
+- Storage/API behavior must be covered by the shared memory/S3 contract and fake-S3 tests; UI behavior must have headless-browser regression tests. No new framework or dependency without approval.
 
 **M3 – Preview**
 - Text / image / PDF preview; other types offer download

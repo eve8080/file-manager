@@ -514,6 +514,132 @@ describe('browser UI', { skip: chromePath ? false : 'Chrome not found (set CHROM
     });
   });
 
+  describe('M1 closure (D19): overlapping mutations in the same folder', () => {
+    beforeEach(() => {
+      storage = createMemoryStorage({ 'here/': '', 'other/': '' });
+    });
+
+    const startCreate = (name) =>
+      page.evaluate(`(() => {
+        document.getElementById('new-folder-name').value = ${JSON.stringify(name)};
+        document.getElementById('new-folder-form').requestSubmit();
+      })()`);
+
+    it('a success whose reload was superseded by a newer reload is still reported', async () => {
+      await open('#/here/');
+      await waitLoaded('here/');
+      mutationDelay = 300;
+      listDelays.set('here/', 300); // the first reload is still running when the second one starts
+      await startCreate('one');
+      await sleep(100);
+      await startCreate('two');
+      await page.waitFor(`document.getElementById('status').textContent.includes('Created')`, { timeout: 3000 });
+      await sleep(700); // let every reload settle
+      const s = await state();
+      assert.equal(s.status, 'Created folder "one". Created folder "two".');
+      assert.equal(s.statusIsError, false);
+      assert.deepEqual(s.names, ['one', 'two']);
+    });
+
+    it('a success whose reload was superseded by a partial delete\'s reload is reported with it', async () => {
+      storage = createS3Storage({
+        bucket: 'test',
+        client: new FakeS3Client(
+          { 'here/': '', 'here/big/': '', 'here/big/a.txt': 'a', 'here/big/b.txt': 'b' },
+          { failDeleteKeys: ['here/big/b.txt'] },
+        ),
+      });
+      answer = ({ type }) => (type === 'prompt' ? { accept: true, promptText: 'big' } : { accept: true });
+      const originalError = console.error;
+      console.error = () => {}; // the S3 driver logs the simulated failure
+      try {
+        await open('#/here/');
+        await waitLoaded('here/');
+        mutationDelay = 300;
+        listDelays.set('here/', 600); // the create's reload is still running when the delete's starts
+        await startCreate('one');
+        await sleep(100);
+        await page.evaluate(`document.querySelector('button[aria-label="Delete folder big"]').click()`);
+        await page.waitFor(`document.getElementById('status').textContent.includes('stopped partway')`, { timeout: 5000 });
+        await sleep(900);
+        const s = await state();
+        assert.match(s.status, /^Created folder "one"\. Delete of "big" stopped partway: 2 deleted, 1 may remain\./);
+        assert.equal(s.statusIsError, true);
+      } finally {
+        console.error = originalError;
+      }
+    });
+
+    // Blocker 2: a partial delete whose own reload is superseded by a later success's reload.
+    describe('a partial-delete warning is never replaced by a later success', () => {
+      let originalError;
+      beforeEach(() => {
+        storage = createS3Storage({
+          bucket: 'test',
+          client: new FakeS3Client(
+            { 'here/': '', 'here/big/': '', 'here/big/a.txt': 'a', 'here/big/b.txt': 'b', 'other/': '' },
+            { failDeleteKeys: ['here/big/b.txt'] },
+          ),
+        });
+        answer = ({ type }) => (type === 'prompt' ? { accept: true, promptText: 'big' } : { accept: true });
+        originalError = console.error;
+        console.error = () => {}; // the S3 driver logs the simulated failure
+      });
+      afterEach(() => {
+        console.error = originalError;
+      });
+
+      // Starts the partial delete, waits until its reload is running, then starts a create whose
+      // reload supersedes it.
+      async function partialDeleteThenCreate() {
+        await open('#/here/');
+        await waitLoaded('here/');
+        mutationDelay = 300;
+        listDelays.set('here/', 600);
+        await page.evaluate(`document.querySelector('button[aria-label="Delete folder big"]').click()`);
+        while (listCalls.length < 2) await sleep(10); // the partial delete's reload has started
+        await startCreate('one');
+      }
+
+      it('in the same folder: the final status keeps the warning, as an error', async () => {
+        await partialDeleteThenCreate();
+        await page.waitFor(`document.getElementById('status').textContent.includes('Created folder "one"')`, { timeout: 5000 });
+        await sleep(900);
+        const s = await state();
+        assert.match(s.status, /Delete of "big" stopped partway: 2 deleted, 1 may remain\./);
+        assert.match(s.status, /Created folder "one"\./);
+        assert.equal(s.statusIsError, true);
+      });
+
+      it('after navigating away: the warning is alerted, not shown in the new folder (D16)', async () => {
+        await partialDeleteThenCreate();
+        await sleep(450); // the create has finished and its reload superseded the delete's
+        await page.evaluate(`location.hash = '#/other/'`);
+        await waitLoaded('other/');
+        await sleep(900);
+        const s = await state();
+        assert.equal(s.status, '');
+        const alerts = dialogs.filter((d) => d.type === 'alert');
+        assert.equal(alerts.length, 1);
+        assert.match(alerts[0].message, /Delete of "big" stopped partway: 2 deleted, 1 may remain/);
+      });
+    });
+
+    it('a success whose reload was cut short by navigation is not reported in the next folder (D16)', async () => {
+      await open('#/here/');
+      await waitLoaded('here/');
+      listDelays.set('here/', 400);
+      await startCreate('one');
+      await page.waitFor(`document.getElementById('status').textContent === 'Loading…'`); // its reload is running
+      await page.evaluate(`location.hash = '#/other/'`);
+      await waitLoaded('other/');
+      await startCreate('two');
+      await page.waitFor(`document.getElementById('status').textContent.includes('Created')`, { timeout: 3000 });
+      await sleep(600);
+      assert.equal((await state()).status, 'Created folder "two".');
+    });
+  });
+
   describe('M1 closure: N4 sorting and toolbar touch targets', () => {
     beforeEach(() => {
       storage = createMemoryStorage();

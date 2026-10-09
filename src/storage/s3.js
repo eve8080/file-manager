@@ -31,11 +31,19 @@ export function createS3Storage({ bucket, region, client = new S3Client({ region
     return keys;
   }
 
+  // The first `maxKeys` keys under a prefix. S3 may return a short page that is still truncated,
+  // so continuation pages are followed until enough keys are seen or the listing ends.
+  async function firstKeysUnder(prefix, maxKeys) {
+    const keys = [];
+    for await (const page of listPages({ Prefix: prefix, MaxKeys: maxKeys })) {
+      for (const object of page.Contents ?? []) keys.push(object.Key);
+      if (keys.length >= maxKeys) break;
+    }
+    return keys.slice(0, maxKeys);
+  }
+
   async function anyUnder(prefix) {
-    const page = await client.send(
-      new ListObjectsV2Command({ Bucket: bucket, Prefix: prefix, MaxKeys: 1 }),
-    );
-    return (page.Contents?.length ?? 0) > 0;
+    return (await firstKeysUnder(prefix, 1)).length > 0;
   }
 
   return {
@@ -70,7 +78,9 @@ export function createS3Storage({ bucket, region, client = new S3Client({ region
     },
 
     async deleteFolder(prefix, { recursive = false } = {}) {
-      const keys = await allKeysUnder(prefix);
+      // A non-recursive delete only needs to know if anything besides the marker exists. The marker
+      // sorts first, so two keys are enough; the whole prefix is listed only for a recursive delete.
+      const keys = recursive ? await allKeysUnder(prefix) : await firstKeysUnder(prefix, 2);
       if (keys.length === 0) throw notFound('Folder not found');
       if (!recursive && keys.some((key) => key !== prefix)) {
         throw conflict('FOLDER_NOT_EMPTY', 'Folder is not empty');

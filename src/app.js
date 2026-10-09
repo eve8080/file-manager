@@ -20,7 +20,7 @@ export function createApp({ storage }) {
   });
 
   api.get('/list', async (req, res) => {
-    const prefix = parsePrefix(req.query.prefix);
+    const prefix = parsePrefix(queryParam(req, 'prefix'));
     const { folders, files } = await storage.list(prefix);
     res.json({
       prefix,
@@ -36,9 +36,9 @@ export function createApp({ storage }) {
   });
 
   api.delete('/folders', async (req, res) => {
-    const prefix = parseFolderPath(req.query.path);
-    const recursive = parseBoolean(req.query.recursive, 'recursive');
-    requireRecursiveConfirmation(prefix, recursive, req.query.confirm);
+    const prefix = parseFolderPath(queryParam(req, 'path'));
+    const recursive = parseBoolean(queryParam(req, 'recursive'), 'recursive');
+    requireRecursiveConfirmation(prefix, recursive, queryParam(req, 'confirm'));
     const deleted = await storage.deleteFolder(prefix, { recursive });
     res.json({ path: prefix, deleted });
   });
@@ -51,6 +51,15 @@ export function createApp({ storage }) {
   app.use(express.static(PUBLIC_DIR));
   app.use(errorHandler);
   return app;
+}
+
+// Express's "simple" query parser keeps `name[x]=v` as a literal key, so `req.query[name]` would be
+// undefined and the parameter's default (root, non-recursive) would be used silently. Reject it instead.
+function queryParam(req, name) {
+  if (Object.keys(req.query).some((key) => key.startsWith(`${name}[`))) {
+    throw badRequest(`${name} must be a single value`);
+  }
+  return req.query[name];
 }
 
 function parseBoolean(value, name) {

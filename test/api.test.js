@@ -100,6 +100,27 @@ describe('GET /api/list', () => {
   }
 });
 
+describe('structured query values (D19)', () => {
+  // Express's query parser keeps `name[x]` as a literal key, so without a check these would fall
+  // back to the parameter's default (root listing, non-recursive delete) instead of failing.
+  const requests = [
+    ['GET', '/api/list?prefix[a]=b'],
+    ['GET', '/api/list?prefix[]=docs'],
+    ['DELETE', '/api/folders?path[a]=empty/'],
+    ['DELETE', '/api/folders?path=empty/&recursive[a]=true'],
+    ['DELETE', '/api/folders?path=docs/&recursive=true&confirm[a]=docs'],
+  ];
+  it('rejects them with 400, like repeated values, without touching storage', async () => {
+    for (const [method, path] of requests) {
+      const res = await call(method, path);
+      assert.equal(res.status, 400, `${method} ${path}`);
+      assert.equal(res.body.error.code, 'BAD_REQUEST', `${method} ${path}`);
+    }
+    assert.equal((await call('GET', '/api/list?prefix=empty/')).status, 200);
+    assert.deepEqual((await call('GET', '/api/list?prefix=docs/')).body.files.map((f) => f.name), ['a.txt']);
+  });
+});
+
 describe('POST /api/folders', () => {
   it('creates a folder', async () => {
     const res = await call('POST', '/api/folders', { path: 'docs/new' });
@@ -192,6 +213,15 @@ describe('DELETE /api/folders', () => {
     assert.equal((await call('DELETE', '/api/folders?path=nope/&recursive=true&confirm=nope')).status, 404);
     assert.equal((await call('DELETE', '/api/folders')).status, 400);
     assert.equal((await call('DELETE', '/api/folders?path=docs/&recursive=yes')).status, 400);
+  });
+
+  it('returns 409 and keeps the marker when S3 returns the marker and a child on separate pages', async () => {
+    const client = new FakeS3Client({ 'x/': '', 'x/child.txt': 'c' }, { pageSize: 1 });
+    storage = createS3Storage({ bucket: 'test', client });
+    const res = await call('DELETE', '/api/folders?path=x/');
+    assert.equal(res.status, 409);
+    assert.equal(res.body.error.code, 'FOLDER_NOT_EMPTY');
+    assert.deepEqual([...client.objects.keys()].sort(), ['x/', 'x/child.txt']);
   });
 
   it('returns a structured 502 DELETE_INCOMPLETE when S3 deletes only part of a folder', async () => {

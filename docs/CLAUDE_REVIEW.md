@@ -1,81 +1,72 @@
 # Fresh Claude Review
 
-- Reviewed at: 2026-10-09T08:56:13+08:00
-- Claude session: 8a34b2ba-fb9d-42f9-8c04-992e87eb9e00
+- Reviewed at: 2026-10-09T10:32:26+08:00
+- Claude session: c011baf4-632c-4125-a64c-56a20f455520
 - Completion subtype: success
-- Reported cost: US$0.84
+- Reported cost: US$0.97
 - Mode: fresh session; Claude tools restricted to Read and Bash; no Edit or Write tool
 
 VERDICT: PASS
 
-# M1 re-review after the N1–N4 fixes: passes, with 4 minor findings
+M1 is ready for Eve's gates. Every acceptance criterion has direct evidence, all 154 tests pass with none skipped, and I found no blocking correctness, security, privacy or integration issue. No files were changed and nothing was staged, committed or pushed.
 
-I changed no project files and made no commits, pushes or network writes. Nothing touched AWS. The only files I created were two scratch files outside the project: `/tmp/fm-review-demo.log` and `/tmp/fm-body`.
+## Acceptance criteria (M1, including D18 and D19)
 
-## Acceptance criteria (M1, plus M0, which was delivered with it)
-
-| Criterion | Result | Evidence |
+| Criterion | Evidence | Result |
 |---|---|---|
-| M0: `npm test` passes | ✅ | 145 tests: 145 pass, 0 fail, 0 skipped |
-| M0: serves on `127.0.0.1:3000` | ✅ with a note | It binds to `127.0.0.1` by default. On this Mac, port 3000 is held by another `node` process (pid 1862), so startup fails cleanly. On free ports it serves; the curl results are below. |
-| M0: missing `S3_BUCKET` / `AWS_REGION` gives a clear message | ✅ | `Configuration error: S3_BUCKET is required…` and `…AWS_REGION is required…`, both exit 1 |
-| M0: path validator rejects bad paths | ✅ | `src/paths.js:30-37`; `test/paths.test.js`; curl `prefix=../etc` → 400 |
-| Listing: folders first, markers hidden, breadcrumbs, sorting | ✅ | Storage contract tests pass for memory, s3 and s3 with 2-item pages. The new N4 test (`test/browser.test.js:537-555`) checks the exact row order for all six sort orders, with folders first. |
-| Create folder; 409 if it exists | ✅ | Tests pass; curl 201, then 409 `FOLDER_EXISTS` |
-| Delete: empty folder; non-empty → 409; `a/` vs `ab/`; more than 1000 objects; paginated listings | ✅ | Storage tests and s3 driver tests (2500 keys, 2-item pages); curl 409 `FOLDER_NOT_EMPTY` |
-| Recursive delete needs the exact folder name in `confirm` (server-side) | ✅ | `src/app.js:64-75`; curl gives `CONFIRMATION_REQUIRED`, `CONFIRMATION_MISMATCH` (`documents` vs `Documents`), then 200 `deleted: 3` |
-| Partial delete → structured 502 `DELETE_INCOMPLETE`, stops at the first failing batch | ✅ | `src/storage/s3.js:81-125`; s3 driver tests pass |
-| Missing folder 404 / bad path 400 / non-IP Host 403 | ✅ | curl: 404, 400, 403 for `evil.example` and for `127.0.0.1.nip.io` |
-| Phone width, back button, touch targets ≥ 44×44 | ✅ | Browser tests at 375 px; the new toolbar test runs at 375 and 1280 px (`:557-576`) |
-| Rapid navigation keeps the URL and `current.prefix` in sync | ✅ | Finding-1 browser tests pass; `load()` uses the sequence number and abort (`public/app.js:164-193`) |
-| A create/delete finishing after navigation doesn't change the new folder's status | ✅ | The 8 review-2 browser tests pass; `navigationToken()` is checked after every `await` |
-| Storage errors reach clients only as fixed reasons | ✅ | `src/app.js:120-125`, `src/errors.js`; the API mapping tests pass |
-| **N1** busy port → exit 1, one error line, no "listening" | ✅ | `src/start.js:9-24` logs only on `'listening'`. `test/start.test.js` covers 4 cases. I reproduced it by hand with both `demo.js` and `server.js` on port 3000: exactly one line, exit 1. EACCES (port 80) and ENOTFOUND (bad HOST) also gave one line each, exit 1. |
-| **N2** a bad or non-canonical hash is replaced in place, with no loop | ✅ | `public/app.js:168-169` uses `replaceState`. Browser tests `:417-455` assert the exact list calls and `history.length`. |
-| **N3** a failed reload after create/delete is reported | ✅ | `reloadAndReport` (`public/app.js:197-202`) and the partial-delete path (`:259-265`). Browser tests `:470-514` assert the exact error text for create, delete and partial delete. |
-| **N4** six sort orders, folders first, toolbar ≥ 44×44 at 375 and 1280 px | ✅ | `test/browser.test.js:517-577` |
+| List root and nested folders; folders first; markers hidden; breadcrumbs; sort by name/size/date | `test/storage.test.js:29-58` (contract tests run against memory, s3, and s3 with 2-item pages); `test/api.test.js:66-88`; `test/browser.test.js:663` (all six sort orders, folders first) | ✅ |
+| Create folder; 409 if it already exists | `test/api.test.js:125,133`; contract tests `:62,69`; live demo: 201, then 409 `FOLDER_EXISTS` | ✅ |
+| Delete empty folder; non-empty → 409; recursive delete leaves siblings alone (`a/` vs `ab/`); more than 1000 objects; paginated listings | contract tests `:75,81,87`; `storage.test.js:121,250`; live demo: `Documents/` → 409 | ✅ |
+| Recursive delete needs the exact name in `confirm` | `api.test.js:159-211`; live demo: no `confirm` → `CONFIRMATION_REQUIRED`, `confirm=documents` → `CONFIRMATION_MISMATCH` | ✅ |
+| Partial delete → 502 `DELETE_INCOMPLETE`; stops at the first failing batch; tests show exactly what remains | `storage.test.js:141,187,200,211,238`; `api.test.js:227` | ✅ |
+| Missing folder → 404, invalid path → 400, bad Host → 403 | `api.test.js:88,95,316`; live demo: `../x` → 400, `Host: evil.example` → 403, missing folder → 404 | ✅ |
+| Phone width, back button, touch targets ≥ 44×44 | `browser.test.js:393,684` (at 375 px and 1280 px) | ✅ |
+| Rapid navigation keeps the URL and `current.prefix` in step | `browser.test.js:112,149,168` | ✅ |
+| A create/delete finishing after navigation never changes the new folder's status | `browser.test.js:283-381` | ✅ |
+| Storage errors reach clients only as fixed reasons | `api.test.js:282`; `storage.test.js:112` | ✅ |
+| N1: port already in use → exit 1, one error line, no "listening" | `test/start.test.js:61,73` | ✅ |
+| N2: bad or non-canonical hash is fixed in place | `browser.test.js:417,439,450` | ✅ |
+| N3: a failed reload after create/delete is still reported | `browser.test.js:470,485,496` | ✅ |
+| N4: six sort orders, folders first, toolbar ≥ 44 px | `browser.test.js:663,684` | ✅ |
+| D19-1: structured query values (`prefix[a]=b`) → 400 | `src/app.js:58-63`, used for `prefix`, `path`, `recursive` and `confirm` (`:23,39-41`); `api.test.js:103-122`; live demo: all five bracketed forms → 400 with the right parameter named; `prefix%5Ba%5D=b` → 400; repeated `prefix` → 400 | ✅ |
+| D19-2: non-recursive delete uses a bounded listing | `src/storage/s3.js:36-43,83`; `storage.test.js:163` (1 list request, `MaxKeys ≤ 2`, 2501 objects kept); B1 fix for short truncated pages `:178`, `api.test.js:218` | ✅ |
+| D19-3: overlapping same-folder mutations keep every outcome; D16 still holds | `public/app.js:22,203-214,271,281-288`; `browser.test.js:528,544,604,614,628` | ✅ |
+| D19-4: decision numbers in order | `IMPLEMENTATION_BRIEF.md:15-35` runs D1…D19 in order (D17 now comes before D18) | ✅ |
 
-**Wiring:** `src/server.js` → `start()` → `createApp` → `createS3Storage` is the real startup path, and `src/demo.js` uses the same `start()` and `createApp`. `test/start.test.js` launches the real entry points as child processes, not a test copy. The UI changes are in the served `public/app.js`; `/app.js` returned 200 from the running demo.
+Everything is wired into the real path: `queryParam` is called from the actual route handlers, `firstKeysUnder` from `deleteFolder` and `createFolder` in the real S3 driver, and `pendingReports` from the UI's create/delete handlers and the `hashchange` listener.
 
 ## Commands run
 
-| Command | Outcome |
+| Command | Result |
 |---|---|
-| `npm test` (Node v26.8.1) | 145 tests, 145 pass, 0 fail, 0 skipped, 26 suites, about 13.5 s |
-| `node --test test/browser.test.js test/chrome-helper.test.js`, run twice | 34/34 pass, 0 skipped, both runs |
-| `node --check` on every `.js` file in `src/`, `src/storage/`, `public/`, `test/`, `test/helpers/` | no failures |
-| `npm ls --depth=0` | only `@aws-sdk/client-s3@3.1147.0` and `express@5.2.1` |
-| `env -i … node src/demo.js` and `env -i … S3_BUCKET=dummy AWS_REGION=us-east-1 node src/server.js` (port 3000 busy) | each printed only `Could not start server: 127.0.0.1:3000 is already in use (EADDRINUSE). Set PORT to a free port.` and exited 1 |
-| Missing bucket / missing region / `PORT=abc` / `PORT=80` / `HOST=999.1.1.1` | each gave one clear error line and exit 1 |
-| `HOST=0.0.0.0 PORT=3172 node src/demo.js` | "listening" line plus the no-login network warning |
-| `HOST=::1 PORT=3173 node src/demo.js` + curl `[::1]` | `http://[::1]:3173`; health 200 |
-| `PORT=3174 node src/demo.js` + 23 curl requests | everything matched the brief (table above). Security headers present, no `x-powered-by`; `/..%2fsrc%2fapp.js` → 404; recursive delete 200, then a repeat → 404. Server stopped. |
-| `lsof -iTCP:3000` | `node` pid 1862 owns `127.0.0.1:3000` |
-| Secret grep (AWS key IDs, private keys, secret/password/token assignments; excluding `node_modules` and `.git`) | no matches. No `.env` file exists. |
-| `git status --short --untracked-files=all` / `git remote -v` | 30 untracked files, no commits, no remote. This matches the handoff. |
-| `pgrep` for demo, server or Chrome processes; Chrome profiles in `$TMPDIR` | none left. The only `file-manager-*` entries in `$TMPDIR` are two older directories dated Oct 8 23:44 (`file-manager-fresh-*`, `file-manager-lock-audit-*`), not created by the test runs |
-| `npm audit` | **Not run**, because it sends the lockfile to the npm registry. Dependencies match the last audited set. |
-| Lint / type check / build | none configured (plain JS by design) |
+| `git status --porcelain=v1 -uall`, `git diff` | 8 tracked files modified, 0 untracked; all diffs reviewed |
+| `npm test` (Node v26.8.1) | exit 0: **154 tests, 154 pass, 0 fail, 0 skipped**, 29 suites, about 22.5 s |
+| `node --test test/browser.test.js` ×3 | 30/30 pass each time, 0 skipped (no flakiness seen) |
+| `node --check` on every tracked `.js` file | no failures |
+| `npm ls --depth=0` | `@aws-sdk/client-s3@3.1147.0`, `express@5.2.1`; no new dependencies |
+| `git diff --quiet HEAD -- package.json package-lock.json README.md CLAUDE.md docs/CLAUDE_REVIEW.md` | unchanged |
+| `PORT=3917 node src/demo.js` plus curl calls (`curl -g` for the bracketed forms) | all responses as in the table above; demo stopped afterwards, nothing left running |
+| Tracked files searched for `AKIA…`, `aws_secret_access_key`, `-----BEGIN`; `git check-ignore .env` | no matches; `.env` does not exist and is git-ignored |
+| Frontend searched for `innerHTML`, `outerHTML`, `insertAdjacentHTML`, `eval(` | only a code comment; all text is set with `textContent` |
+| `pgrep` for Chrome, demo and server processes | none |
 
-One of my own smoke-test shell commands hung on `wait` and was stopped (exit 144). The curl results it printed are complete, and I stopped the demo server separately with `pkill`. This was a problem in my script, not the app.
+My first two curl attempts gave no valid results (curl treated `[a]` as a pattern, then zsh didn't split my loop variable). I discarded them and reran the requests one by one with explicit quoting; only the rerun results are used above.
 
 ## Blocking findings
 None.
 
 ## Non-blocking findings
-1. **Finding 6 from the previous review is still open.** I confirmed it: `GET /api/list?prefix[a]=b` → 200 with the root listing. By contrast, `prefix=a&prefix=b` correctly returns 400 "Path must be a single string". This is harmless, and the handoff lists it as awaiting a decision.
-2. **Finding 5 from the previous review is still open.** A non-recursive delete reads every key under the folder (`src/storage/s3.js:73`) just to decide whether to answer 409. The same file already has an `anyUnder()` helper (`:34-39`) that looks at only one key, but a check for "anything besides the marker" would need at most 2 keys.
-3. **`public/app.js:199`: a success message can be dropped without navigation.** If two operations run in the same folder and the second one's reload makes the first one's reload stale, the first success message is never shown. This is minor, not data loss, and it predates N3.
-4. **Docs:** in `IMPLEMENTATION_BRIEF.md:33-34`, D18 is listed before D17. Cosmetic only.
+1. **Known gap, already listed in `docs/HANDOFF.md`:** an ordinary error such as 409 `FOLDER_EXISTS` is shown straight away without a reload (`public/app.js:231-232`). A reload from an earlier success that finishes later then replaces it with that success's message (`public/app.js:211`). Nothing is lost; Eve should decide whether to fix it in M2.
+2. **`origin/main` already holds `a8f2021`** (`git branch -vv` shows `[origin/main]`), so that commit reached the remote at some point. HANDOFF says this session didn't add the remote or push. It still conflicts with the CLAUDE.md rule against pushing until Mr. So asks, so Eve should confirm he authorised it. Nothing about evaluating this milestone needs that remote.
+3. **Name mismatch:** `package-lock.json` says `file-manager` while `package.json` says `s3-file-manager`. This was already true at HEAD and is cosmetic.
+4. **Old temp folders:** `$TMPDIR/file-manager-fresh-*` and `file-manager-lock-audit-*` are from 2026-10-08, not from these test runs.
 
 ## Residual risks
-- Nothing has run against real S3 yet; storage errors are only tested with simulated failures. That is M4.
-- There is no login. The Host guard is the only defence against DNS rebinding, so the app must never be exposed to the internet.
-- Port 3000 is taken on this Mac, so `npm start` and `npm run demo` fail cleanly until `PORT` is set. This matters for M4.
-- Deletes are permanent unless bucket versioning is on, and a delete request that times out may still have deleted its batch.
-- Browser tests depend on local Chrome and fixed delays. They were stable in my 3 runs (1 full suite plus 2 browser-only runs).
+- Nothing has been run against real S3. The bounded-listing and short-page logic is only checked against a fake client. The logic is sound: the marker sorts before every key under it, and continuation pages are followed until enough keys are seen.
+- The check-then-act steps (folder exists before create; contents before a non-recursive delete) aren't atomic. In the worst case only the marker is deleted, never a child.
+- The browser tests rely on fixed delays of 300–900 ms. They were stable over 4 runs here but could be flaky on a slow machine.
+- There is no login. Safety depends on binding to `127.0.0.1` plus the Host guard.
+- No person has checked the app on a phone or desktop.
 
 ## Recommended next action
-1. Eve or Mr. So accepts M1.
-2. Decide whether findings 5 and 6 are fixed now or deferred to M2. Both are small.
-3. Make a first local commit only with explicit approval. Nothing in this review needs a commit, push, deployment or external write.
+Eve runs her deterministic gates and decides whether to accept M1, and confirms the `origin/main` push was authorised. Commit only with explicit approval, and don't push. M2 can start once that's done.

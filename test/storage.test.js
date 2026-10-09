@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { ListObjectsV2Command } from '@aws-sdk/client-s3';
 import { createMemoryStorage } from '../src/storage/memory.js';
 import { createS3Storage } from '../src/storage/s3.js';
 import { FakeS3Client } from './helpers/fake-s3-client.js';
@@ -157,6 +158,30 @@ describe('s3 driver specifics', () => {
     });
     assert.equal(client.deleteCalls, 1, 'later batches must not be attempted');
     assert.deepEqual([...client.objects.keys()].sort(), ['big/0500', ...range(1000, 2500)]);
+  });
+
+  it('decides a non-recursive delete with one bounded listing (marker plus one child)', async () => {
+    const client = new FakeS3Client({ 'big/': '', ...bigFolder() }, { pageSize: 1000 });
+    const listInputs = [];
+    const send = client.send.bind(client);
+    client.send = (command) => {
+      if (command instanceof ListObjectsV2Command) listInputs.push(command.input);
+      return send(command);
+    };
+    await assert.rejects(createS3Storage({ bucket: 'b', client }).deleteFolder('big/'), { code: 'FOLDER_NOT_EMPTY' });
+    assert.equal(listInputs.length, 1, 'one listing request, not the whole prefix');
+    assert.ok(listInputs[0].MaxKeys <= 2, `MaxKeys ${listInputs[0].MaxKeys}`);
+    assert.equal(client.deleteCalls, 0);
+    assert.equal(client.objects.size, 2501);
+  });
+
+  it('follows a short truncated page before deciding a non-recursive delete (marker first, child later)', async () => {
+    // S3 may return fewer keys than MaxKeys with IsTruncated set; pageSize 1 forces exactly that.
+    const client = new FakeS3Client({ 'x/': '', 'x/child.txt': 'c' }, { pageSize: 1 });
+    await assert.rejects(createS3Storage({ bucket: 'b', client }).deleteFolder('x/'), { code: 'FOLDER_NOT_EMPTY' });
+    assert.equal(client.deleteCalls, 0, 'nothing deleted');
+    assert.deepEqual([...client.objects.keys()].sort(), ['x/', 'x/child.txt']);
+    assert.equal(client.calls.filter((c) => c === 'ListObjectsV2Command').length, 2, 'stops once a child is seen');
   });
 
   it('reports a failure in a later batch with the earlier batches counted as deleted', async () => {
