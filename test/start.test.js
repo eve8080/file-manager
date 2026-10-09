@@ -45,6 +45,43 @@ async function freePort() {
   return port;
 }
 
+// M2: MAX_UPLOAD_MB from the environment must reach the running app (both entry points go through start()).
+describe('MAX_UPLOAD_MB reaches the running app (src/demo.js)', () => {
+  let child;
+  let url;
+  before(async () => {
+    const port = await freePort();
+    child = spawn(process.execPath, ['src/demo.js'], {
+      env: { PATH: process.env.PATH, HOST: '127.0.0.1', PORT: String(port), MAX_UPLOAD_MB: '0.001' }, // 1048 bytes
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('demo did not start')), 10_000);
+      child.stdout.on('data', (chunk) => {
+        if (/listening/.test(chunk)) {
+          clearTimeout(timer);
+          resolve();
+        }
+      });
+    });
+    url = `http://127.0.0.1:${port}`;
+  });
+  after(() => child?.kill('SIGTERM'));
+
+  const upload = (name, size) => {
+    const form = new FormData();
+    form.append('files', new Blob([Buffer.alloc(size)]), name);
+    return fetch(`${url}/api/files?prefix=`, { method: 'POST', body: form });
+  };
+
+  it('a file over the configured limit is 413; one under it is stored', async () => {
+    const over = await upload('over.bin', 2000);
+    assert.equal(over.status, 413);
+    assert.equal((await over.json()).error.details.files[0].error.message, 'File is larger than the upload limit (1048 bytes).');
+    assert.equal((await upload('under.bin', 1000)).status, 201);
+  });
+});
+
 describe('server startup logging', () => {
   let blocker;
   let busyPort;

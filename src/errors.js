@@ -74,6 +74,36 @@ export function classifyStorageError(err) {
   return storageReason(knownName(err), err?.$metadata?.httpStatusCode);
 }
 
+// A file must not take a folder's visible name, and no part of its path may be a file
+// (otherwise a listing would show a file and a folder with the same name).
+export const folderNameConflict = () => conflict('NAME_CONFLICT', 'A folder with that name already exists');
+export const pathNameConflict = () => conflict('NAME_CONFLICT', 'Part of that path is a file, not a folder');
+
+// The client-facing form of any error, as { status, code, message, details? }. AppErrors pass through;
+// storage failures become a fixed reason; anything else is a generic 500. The raw error of the last two
+// is logged server-side only.
+export function toPublicError(err) {
+  if (err instanceof AppError) {
+    return { status: err.status, code: err.code, message: err.message, ...(err.details === undefined ? {} : { details: err.details }) };
+  }
+  console.error(err);
+  if (isStorageError(err)) {
+    const reason = classifyStorageError(err);
+    return { status: 502, code: 'STORAGE_ERROR', message: STORAGE_REASONS[reason], details: { reason } };
+  }
+  return { status: 500, code: 'INTERNAL_ERROR', message: 'Internal server error' };
+}
+
+// A move (copy-then-delete) whose copy succeeded but whose source could not be deleted, so the file
+// now exists under both names. details: { from, to, copied: true, sourceDeleted: false, reason }
+export const moveIncomplete = (details) =>
+  new AppError(
+    502,
+    'MOVE_INCOMPLETE',
+    'The file was copied to the new name, but the original could not be removed. It now exists under both names.',
+    details,
+  );
+
 // A recursive delete that stopped partway. `details` says exactly what is known:
 // { path, requested, deleted, failedCount, failed: [{ key, reason }] (first 20), unknown, notAttempted, reason? }
 // `reason` (one of STORAGE_REASONS' keys) is present when a whole delete request failed.

@@ -1,15 +1,16 @@
 import { afterEach, beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { Readable } from 'node:stream';
 import { ListObjectsV2Command } from '@aws-sdk/client-s3';
 import { createMemoryStorage } from '../src/storage/memory.js';
 import { createS3Storage } from '../src/storage/s3.js';
-import { FakeS3Client } from './helpers/fake-s3-client.js';
+import { FakeS3Client, TEST_SIGNER } from './helpers/fake-s3-client.js';
 
 const drivers = {
   memory: (initial) => createMemoryStorage(initial),
-  s3: (initial) => createS3Storage({ bucket: 'test-bucket', client: new FakeS3Client(initial) }),
+  s3: (initial) => createS3Storage({ bucket: 'test-bucket', client: new FakeS3Client(initial), signingClient: TEST_SIGNER }),
   's3 (2-item pages)': (initial) =>
-    createS3Storage({ bucket: 'test-bucket', client: new FakeS3Client(initial, { pageSize: 2 }) }),
+    createS3Storage({ bucket: 'test-bucket', client: new FakeS3Client(initial, { pageSize: 2 }), signingClient: TEST_SIGNER }),
 };
 
 const SAMPLE = {
@@ -94,6 +95,123 @@ for (const [name, make] of Object.entries(drivers)) {
 
     it('rejects deleting a missing folder with NOT_FOUND', async () => {
       await assert.rejects(make(SAMPLE).deleteFolder('missing/'), { status: 404, code: 'NOT_FOUND' });
+    });
+
+    // ---- M2: files ----
+
+    it('deletes a file and nothing else', async () => {
+      const storage = make(SAMPLE);
+      await storage.deleteFile('a/one.txt');
+      assert.deepEqual((await storage.list('a/')).files.map((f) => f.name), ['two.txt']);
+      assert.deepEqual((await storage.list('ab/')).files.map((f) => f.name), ['keep.txt']);
+    });
+
+    it('rejects deleting a missing file with NOT_FOUND, even where a folder of that name exists', async () => {
+      const storage = make(SAMPLE);
+      await assert.rejects(storage.deleteFile('a/missing.txt'), { status: 404, code: 'NOT_FOUND' });
+      await assert.rejects(storage.deleteFile('empty'), { status: 404, code: 'NOT_FOUND' });
+      assert.deepEqual(await storage.list('empty/'), { folders: [], files: [] }, 'the folder is untouched');
+    });
+
+    it('moves (renames) a file, keeping its content', async () => {
+      const storage = make(SAMPLE);
+      await storage.moveFile('a/two.txt', 'a/renamed.txt');
+      assert.deepEqual((await storage.list('a/')).files.map((f) => [f.name, f.size]), [['one.txt', 1], ['renamed.txt', 2]]);
+      await storage.moveFile('a/renamed.txt', 'new-folder/moved.txt'); // the destination folder need not exist
+      assert.deepEqual((await storage.list('new-folder/')).files.map((f) => [f.name, f.size]), [['moved.txt', 2]]);
+      assert.deepEqual((await storage.list('a/')).files.map((f) => f.name), ['one.txt']);
+    });
+
+    it('refuses to move a missing file (NOT_FOUND) or onto an existing file (FILE_EXISTS)', async () => {
+      const storage = make(SAMPLE);
+      await assert.rejects(storage.moveFile('a/missing.txt', 'a/x.txt'), { status: 404, code: 'NOT_FOUND' });
+      await assert.rejects(storage.moveFile('a/one.txt', 'a/two.txt'), { status: 409, code: 'FILE_EXISTS' });
+      await assert.rejects(storage.moveFile('a/one.txt', 'a/one.txt'), { status: 409, code: 'FILE_EXISTS' });
+      assert.deepEqual((await storage.list('a/')).files.map((f) => [f.name, f.size]), [['one.txt', 1], ['two.txt', 2]]);
+      await assert.rejects(storage.list('a/x.txt/'), { code: 'NOT_FOUND' });
+    });
+
+    it('upload: stores a stream of unknown size and reports its size', async () => {
+      const storage = make(SAMPLE);
+      assert.deepEqual(await storage.putFile('a/new.txt', Readable.from([Buffer.from('he'), Buffer.from('llo')])), { size: 5 });
+      assert.deepEqual(await storage.putFile('a/empty.txt', Readable.from([])), { size: 0 });
+      assert.deepEqual(
+        (await storage.list('a/')).files.map((f) => [f.name, f.size]),
+        [['empty.txt', 0], ['new.txt', 5], ['one.txt', 1], ['two.txt', 2]],
+      );
+    });
+
+    it('upload: refuses to overwrite an existing file (FILE_EXISTS) and keeps the original', async () => {
+      const storage = make(SAMPLE);
+      await assert.rejects(storage.putFile('a/two.txt', Readable.from([Buffer.from('replaced!')])), { status: 409, code: 'FILE_EXISTS' });
+      assert.deepEqual((await storage.list('a/')).files.map((f) => [f.name, f.size]), [['one.txt', 1], ['two.txt', 2]]);
+    });
+
+    it('upload: a stream that fails partway stores nothing', async () => {
+      const storage = make(SAMPLE);
+      const failing = new Readable({ read() {} });
+      failing.push(Buffer.from('partial'));
+      setImmediate(() => failing.destroy(new Error('client went away')));
+      await assert.rejects(storage.putFile('a/broken.txt', failing), { message: 'client went away' });
+      assert.deepEqual((await storage.list('a/')).files.map((f) => f.name), ['one.txt', 'two.txt']);
+    });
+
+    // File/folder name collisions (follow-up 1): a file may not get the visible name of a folder, and no
+    // part of a file's path may be an existing file.
+    const FOLDER_CONFLICT = { status: 409, code: 'NAME_CONFLICT', message: 'A folder with that name already exists' };
+    const PATH_CONFLICT = { status: 409, code: 'NAME_CONFLICT', message: 'Part of that path is a file, not a folder' };
+    const bodyOf = (text) => Readable.from([Buffer.from(text)]);
+
+    it('collision: upload/move onto a folder name (marker or implicit folder) is NAME_CONFLICT; nothing changes', async () => {
+      const storage = make(SAMPLE);
+      for (const key of ['empty', 'implicit', 'a/sub']) {
+        await assert.rejects(storage.putFile(key, bodyOf('x')), FOLDER_CONFLICT, key);
+      }
+      await assert.rejects(storage.moveFile('readme.txt', 'ab'), FOLDER_CONFLICT);
+      assert.deepEqual((await storage.list('')).files.map((f) => f.name), ['readme.txt']);
+      assert.deepEqual((await storage.list('a/')).files.map((f) => f.name), ['one.txt', 'two.txt']);
+    });
+
+    it('collision: upload/move through a path whose part is a file is NAME_CONFLICT', async () => {
+      const storage = make(SAMPLE);
+      await assert.rejects(storage.putFile('readme.txt/x.txt', bodyOf('x')), PATH_CONFLICT);
+      await assert.rejects(storage.moveFile('a/one.txt', 'a/two.txt/deeper/x.txt'), PATH_CONFLICT);
+      await assert.rejects(storage.list('readme.txt/'), { code: 'NOT_FOUND' });
+      assert.deepEqual((await storage.list('a/')).files.map((f) => f.name), ['one.txt', 'two.txt']);
+    });
+
+    it('collision: similar names are not conflicts, and an existing file is still FILE_EXISTS', async () => {
+      const storage = make(SAMPLE);
+      assert.deepEqual(await storage.putFile('abc', bodyOf('1')), { size: 1 }); // folder "ab/" is a different name
+      assert.deepEqual(await storage.putFile('a.txt', bodyOf('1')), { size: 1 }); // folder "a/" is a different name
+      await storage.moveFile('a/one.txt', 'a/sub2.txt');
+      await storage.moveFile('a/sub2.txt', 'brand/new/place.txt'); // new implicit folders are fine
+      await assert.rejects(storage.putFile('readme.txt', bodyOf('x')), { status: 409, code: 'FILE_EXISTS' });
+      await assert.rejects(storage.moveFile('a/two.txt', 'readme.txt'), { status: 409, code: 'FILE_EXISTS' });
+      assert.deepEqual((await storage.list('brand/new/')).files.map((f) => f.name), ['place.txt']);
+    });
+
+    it('download: a missing file (or a folder name) is NOT_FOUND', async () => {
+      const storage = make(SAMPLE);
+      await assert.rejects(storage.getDownload('a/missing.txt'), { status: 404, code: 'NOT_FOUND' });
+      await assert.rejects(storage.getDownload('empty'), { status: 404, code: 'NOT_FOUND' });
+    });
+
+    it('download: memory gives the bytes; S3 gives a presigned GET URL valid for exactly 5 minutes', async () => {
+      const download = await make(SAMPLE).getDownload('a/two.txt');
+      if (name === 'memory') {
+        assert.deepEqual(download, { body: Buffer.from('22') });
+        return;
+      }
+      const url = new URL(download.url);
+      assert.deepEqual(Object.keys(download), ['url']);
+      assert.equal(url.protocol, 'https:');
+      assert.equal(url.hostname, 'test-bucket.s3.us-east-1.amazonaws.com');
+      assert.equal(url.pathname, '/a/two.txt');
+      assert.equal(url.searchParams.get('X-Amz-Expires'), '300');
+      assert.equal(url.searchParams.get('X-Amz-Algorithm'), 'AWS4-HMAC-SHA256');
+      assert.match(url.searchParams.get('X-Amz-Signature'), /^[0-9a-f]{64}$/);
+      assert.equal(url.searchParams.get('response-content-disposition'), `attachment; filename="two.txt"; filename*=UTF-8''two.txt`);
     });
   });
 }
@@ -245,6 +363,149 @@ describe('s3 driver specifics', () => {
       return true;
     });
     assert.deepEqual([...client.objects.keys()].filter((k) => k.startsWith('a/')), ['a/two.txt']);
+  });
+
+  // ---- M2: uploads of unknown size stream into S3 multipart uploads ----
+  const PART = 64; // tiny parts for tests; the fake enforces the same minimum, like S3's 5 MiB
+  const streamingS3 = (initial = {}) => {
+    const client = new FakeS3Client(initial, { minPartSize: PART });
+    return { client, storage: createS3Storage({ bucket: 'b', client, partSize: PART }) };
+  };
+  const bytes = (n, fill = 'x') => Buffer.alloc(n, fill);
+  const called = (client, name) => client.calls.filter((c) => c === name).length;
+
+  it('upload: a stream larger than one part goes up as a multipart upload in parts of exactly partSize', async () => {
+    const { client, storage } = streamingS3();
+    const data = Buffer.concat([bytes(100, 'a'), bytes(100, 'b'), bytes(30, 'c')]); // 230 bytes, odd chunking
+    const chunks = [data.subarray(0, 7), data.subarray(7, 150), data.subarray(150)];
+    assert.deepEqual(await storage.putFile('big.bin', Readable.from(chunks)), { size: 230 });
+    assert.ok(client.objects.get('big.bin').body.equals(data), 'bytes preserved');
+    assert.equal(called(client, 'PutObjectCommand'), 0);
+    assert.equal(called(client, 'CreateMultipartUploadCommand'), 1);
+    const parts = client.inputs.filter((c) => c.name === 'UploadPartCommand').map((c) => c.input);
+    assert.deepEqual(parts.map((p) => [p.PartNumber, p.Body.length]), [[1, 64], [2, 64], [3, 64], [4, 38]]);
+    const complete = client.inputs.find((c) => c.name === 'CompleteMultipartUploadCommand').input;
+    assert.equal(complete.IfNoneMatch, '*', 'never overwrites');
+    assert.equal(client.uploads.size, 0, 'no multipart upload left open');
+  });
+
+  it('upload: parts are sent while the stream is still arriving (streamed, not buffered)', async () => {
+    const { client, storage } = streamingS3();
+    const source = new Readable({ read() {} });
+    const done = storage.putFile('live.bin', source);
+    source.push(bytes(PART + 10));
+    const deadline = Date.now() + 2000;
+    while (called(client, 'UploadPartCommand') === 0) {
+      assert.ok(Date.now() < deadline, 'the first part must be uploaded before the stream ends');
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    source.push(bytes(20));
+    source.push(null);
+    assert.deepEqual(await done, { size: PART + 30 });
+  });
+
+  it('upload: a stream that fits in one part is a single conditional PutObject with a known length', async () => {
+    const { client, storage } = streamingS3();
+    assert.deepEqual(await storage.putFile('small.txt', Readable.from([bytes(PART)])), { size: PART });
+    const put = client.inputs.find((c) => c.name === 'PutObjectCommand').input;
+    assert.equal(put.ContentLength, PART);
+    assert.equal(put.IfNoneMatch, '*');
+    assert.equal(called(client, 'CreateMultipartUploadCommand'), 0);
+  });
+
+  // Abort-on-failure: no multipart upload may be left open, and no object may appear.
+  const assertCleanedUp = (client, key) => {
+    assert.equal(called(client, 'AbortMultipartUploadCommand'), 1, 'aborted once');
+    assert.equal(client.uploads.size, 0, 'no multipart upload left open');
+    assert.ok(!client.objects.has(key), 'no object written');
+  };
+
+  it('upload cleanup: a stream error after parts were sent aborts the multipart upload', async () => {
+    const { client, storage } = streamingS3();
+    const source = new Readable({ read() {} });
+    const done = storage.putFile('cut.bin', source);
+    source.push(bytes(PART * 2 + 1));
+    while (called(client, 'UploadPartCommand') < 2) await new Promise((r) => setTimeout(r, 5));
+    source.destroy(new Error('Unexpected end of form'));
+    await assert.rejects(done, { message: 'Unexpected end of form' });
+    assertCleanedUp(client, 'cut.bin');
+  });
+
+  it('upload cleanup: a failed UploadPart aborts and reports the S3 error', async () => {
+    const { client, storage } = streamingS3();
+    client.failNext('UploadPartCommand', { name: 'SlowDown', status: 503 });
+    await assert.rejects(storage.putFile('p.bin', Readable.from([bytes(PART * 3)])), { name: 'SlowDown' });
+    assertCleanedUp(client, 'p.bin');
+  });
+
+  it('upload cleanup: a failed CompleteMultipartUpload aborts', async () => {
+    const { client, storage } = streamingS3();
+    client.failNext('CompleteMultipartUploadCommand', { name: 'InternalError', status: 500 });
+    await assert.rejects(storage.putFile('c.bin', Readable.from([bytes(PART * 2)])), { name: 'InternalError' });
+    assertCleanedUp(client, 'c.bin');
+  });
+
+  it('upload cleanup: losing the race to another writer (412 on Complete) is FILE_EXISTS and keeps their file', async () => {
+    const { client, storage } = streamingS3();
+    const source = new Readable({ read() {} });
+    const done = storage.putFile('race.bin', source);
+    source.push(bytes(PART + 1));
+    while (called(client, 'UploadPartCommand') < 1) await new Promise((r) => setTimeout(r, 5));
+    client.put('race.bin', 'theirs'); // another writer finishes first
+    source.push(null);
+    await assert.rejects(done, { status: 409, code: 'FILE_EXISTS' });
+    assert.equal(called(client, 'AbortMultipartUploadCommand'), 1);
+    assert.equal(client.uploads.size, 0);
+    assert.equal(client.body('race.bin'), 'theirs');
+  });
+
+  it('upload cleanup: if the abort itself fails, the original error is still reported (and logged)', async () => {
+    const { client, storage } = streamingS3();
+    client.failNext('UploadPartCommand', { name: 'SlowDown', status: 503 });
+    client.failNext('AbortMultipartUploadCommand', { name: 'InternalError', status: 500 });
+    const logged = [];
+    console.error = (...args) => logged.push(args.join(' '));
+    await assert.rejects(storage.putFile('a.bin', Readable.from([bytes(PART * 3)])), { name: 'SlowDown' });
+    assert.match(logged.join('\n'), /Could not abort multipart upload upload-1 for a\.bin/);
+  });
+
+  it('upload: a small upload that loses the race (412 on PutObject) is FILE_EXISTS', async () => {
+    const { client, storage } = streamingS3();
+    client.failNext('PutObjectCommand', { name: 'PreconditionFailed', status: 412 });
+    await assert.rejects(storage.putFile('s.txt', Readable.from([bytes(3)])), { status: 409, code: 'FILE_EXISTS' });
+  });
+
+  // ---- M2: move is copy-then-delete on S3 ----
+
+  it('move: a failed copy never deletes the source', async () => {
+    const client = new FakeS3Client({ 'a.txt': 'A' });
+    client.failNext('CopyObjectCommand', { name: 'AccessDenied', status: 403 });
+    await assert.rejects(createS3Storage({ bucket: 'b', client }).moveFile('a.txt', 'b.txt'), { name: 'AccessDenied' });
+    assert.ok(!client.calls.includes('DeleteObjectCommand'), 'no delete attempted');
+    assert.deepEqual([...client.objects.keys()], ['a.txt']);
+  });
+
+  it('move: copy succeeded but the source could not be deleted → MOVE_INCOMPLETE, both copies kept', async () => {
+    const client = new FakeS3Client({ 'a.txt': 'A' });
+    client.failNext('DeleteObjectCommand', { name: 'AccessDenied', status: 403, message: 'raw detail' });
+    await assert.rejects(createS3Storage({ bucket: 'b', client }).moveFile('a.txt', 'b.txt'), (err) => {
+      assert.equal(err.status, 502);
+      assert.equal(err.code, 'MOVE_INCOMPLETE');
+      assert.deepEqual(err.details, { from: 'a.txt', to: 'b.txt', copied: true, sourceDeleted: false, reason: 'ACCESS_DENIED' });
+      assert.ok(!JSON.stringify(err.details).includes('raw detail'));
+      return true;
+    });
+    assert.deepEqual([client.body('a.txt'), client.body('b.txt')], ['A', 'A']);
+  });
+
+  it('move: CopySource is URL-encoded per segment (spaces, #, ?, %, non-ASCII)', async () => {
+    const from = 'dir one/ré #1?%.txt';
+    const client = new FakeS3Client({ [from]: 'X' });
+    await createS3Storage({ bucket: 'b', client }).moveFile(from, 'dir one/ok.txt');
+    const copy = client.inputs.find((c) => c.name === 'CopyObjectCommand').input;
+    assert.equal(copy.CopySource, 'b/dir%20one/r%C3%A9%20%231%3F%25.txt');
+    assert.deepEqual([...client.objects.keys()], ['dir one/ok.txt']);
+    assert.equal(client.body('dir one/ok.txt'), 'X');
   });
 
   it('paginates listings with many entries', async () => {

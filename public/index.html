@@ -20,6 +20,10 @@
         <input id="new-folder-name" name="name" placeholder="New folder name" required maxlength="255" autocomplete="off">
         <button type="submit">Create folder</button>
       </form>
+      <label class="button upload">
+        Upload files
+        <input id="upload-input" class="visually-hidden" type="file" multiple>
+      </label>
       <label class="sort">
         <span>Sort</span>
         <select id="sort">
@@ -34,6 +38,7 @@
     </div>
 
     <p id="status" class="status" role="status" aria-live="polite"></p>
+    <ul id="uploads" class="uploads" aria-label="Uploads"></ul>
     <ul id="listing" class="listing"></ul>
   </main>
 </body>

@@ -5,8 +5,8 @@ A small personal web file manager for one private AWS S3 bucket, usable from a d
 > ⚠ **No login.** Anyone who can reach the app has full access to the bucket.
 > Run it only on your own machine or a trusted Wi-Fi. Never expose it to the internet.
 
-Status: Milestone 1 (browse, create and delete folders). Uploads, downloads and previews come in later milestones —
-see `IMPLEMENTATION_BRIEF.md`.
+Status: Milestone 2 (folders, plus upload, download, rename/move and delete of files). Previews come in a later
+milestone — see `IMPLEMENTATION_BRIEF.md`.
 
 ## Prerequisites
 - Node.js 22.9 or newer
@@ -25,12 +25,16 @@ Give the credentials access to this bucket only (replace `YOUR-BUCKET`):
     { "Effect": "Allow", "Action": "s3:ListBucket", "Resource": "arn:aws:s3:::YOUR-BUCKET" },
     {
       "Effect": "Allow",
-      "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
+      "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:AbortMultipartUpload"],
       "Resource": "arn:aws:s3:::YOUR-BUCKET/*"
     }
   ]
 }
 ```
+
+Large uploads are streamed to S3 as multipart uploads; if one fails, the app aborts it (hence
+`s3:AbortMultipartUpload`). As a safety net in case an abort itself fails, add a bucket lifecycle rule that
+deletes incomplete multipart uploads after a day or so (S3 console → bucket → Management → Lifecycle rules).
 
 ## Setup
 ```sh
@@ -71,6 +75,31 @@ Errors are returned as `{ "error": { "code": "...", "message": "...", "details"?
 | POST | `/api/folders` with JSON `{ "path": "Documents/New" }` | 201; 409 `FOLDER_EXISTS` |
 | DELETE | `/api/folders?path=Documents/New/` | deletes an empty folder; 409 `FOLDER_NOT_EMPTY` if it has contents |
 | DELETE | `/api/folders?path=Documents/New/&recursive=true&confirm=New` | deletes everything inside. `confirm` must be the folder's exact name (last part of the path, case-sensitive); otherwise 400 `CONFIRMATION_REQUIRED` / `CONFIRMATION_MISMATCH` |
+| POST | `/api/files?prefix=Documents/` (multipart/form-data, one or more file parts) | uploads into the folder; never overwrites. All stored → 201 `{ files: [{ name, key, ok, size }] }`. Otherwise an error `UPLOAD_FAILED` (none stored) / `UPLOAD_INCOMPLETE` (some stored) whose `details.files` lists every file with its own `error` (`FILE_EXISTS` 409, `NAME_CONFLICT` 409, `TOO_LARGE` 413, `REQUEST_TOO_LARGE` 413, `BAD_REQUEST` 400, `STORAGE_ERROR` 502, `MALFORMED_UPLOAD` 400), plus `details.malformed` / `details.requestTooLarge` if reading stopped early. Each file is limited to `MAX_UPLOAD_MB`, the whole request to `MAX_UPLOAD_MB` + 64 KiB (413 `REQUEST_TOO_LARGE`; see below) |
+| GET | `/api/files/download?key=Documents/a.pdf` | real S3: 302 to a presigned download URL valid for 5 minutes. Demo: the file itself as an attachment |
+| POST | `/api/files/move` with JSON `{ "from": "Documents/a.pdf", "to": "Archive/a.pdf" }` | rename/move; 404 if `from` is missing, 409 `FILE_EXISTS` if `to` exists, 409 `NAME_CONFLICT` if `to` is a folder's name or goes through a file. On S3 this is copy-then-delete: if the copy worked but the original could not be removed, **502 `MOVE_INCOMPLETE`** with `details: { from, to, copied, sourceDeleted, reason }` (the file then exists under both names) |
+| DELETE | `/api/files?key=Documents/a.pdf` | deletes one file; 404 if missing |
+
+A file can't take a folder's name, and its path can't pass through a file: uploads and moves that would do
+so get 409 `NAME_CONFLICT` ("A folder with that name already exists" / "Part of that path is a file, not a
+folder"). (Creating a folder where a file of that name exists, or objects written outside the app, can still
+produce both.)
+
+**Upload request limit.** An upload request may be at most `MAX_UPLOAD_MB` + 64 KiB (room for the multipart
+framing). A request that declares a larger `Content-Length` gets 413 `REQUEST_TOO_LARGE` before anything is
+stored. A streamed (chunked) request is cut off at the limit: files completed before it are stored and listed,
+the file in progress fails with `REQUEST_TOO_LARGE`, and the server stops reading and closes the connection.
+A client that keeps sending far beyond the limit may see the connection reset instead of the 413. The browser
+UI sends one file per request: a file over `MAX_UPLOAD_MB` is refused with 413 (`TOO_LARGE`, or
+`REQUEST_TOO_LARGE` once the request passes the request limit); for a file far larger than the limit the UI may
+report "the connection was lost" rather than the size error.
+
+File keys are used exactly as given (no trailing `/`, no `.`/`..`/empty names, no control characters, no
+leading/trailing spaces in a name, at most 1024 bytes); otherwise 400.
+
+Requests that change data and carry a browser `Origin` from another site are refused with 403
+`FORBIDDEN_ORIGIN` (a web page you visit must not be able to upload through your browser). Scripts and the
+AI agent send no `Origin` and are unaffected.
 
 If S3 fails, the response is **502 `STORAGE_ERROR`** with `details: { reason }`, where `reason` is one of
 `ACCESS_DENIED`, `CREDENTIALS_UNAVAILABLE`, `BUCKET_NOT_FOUND`, `THROTTLED`, `NETWORK`, `UNAVAILABLE`, `UNKNOWN`.

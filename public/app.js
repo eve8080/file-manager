@@ -7,6 +7,9 @@ const els = {
   sort: document.getElementById('sort'),
   newFolderForm: document.getElementById('new-folder-form'),
   newFolderName: document.getElementById('new-folder-name'),
+  uploadInput: document.getElementById('upload-input'),
+  uploads: document.getElementById('uploads'),
+  uploadLabel: document.querySelector('label.upload'),
 };
 
 // Invariant: current.prefix always equals the folder in the URL hash (see load()).
@@ -64,6 +67,14 @@ function hashFor(prefix) {
 }
 
 // ---- Rendering ----
+
+// Upload is only possible into the folder on screen after it loaded successfully: uploading into a
+// folder that failed to load (e.g. 404) would create it implicitly. Only the current load toggles this.
+function setUploadEnabled(enabled) {
+  els.uploadInput.disabled = !enabled;
+  els.uploadLabel.setAttribute('aria-disabled', String(!enabled));
+  els.uploadLabel.classList.toggle('disabled', !enabled);
+}
 
 function setStatus(message, isError = false) {
   els.status.textContent = message;
@@ -154,7 +165,20 @@ function renderListing() {
     const row = el('li', 'row file');
     const name = el('span', 'name', file.name);
     name.prepend(el('span', 'icon', '📄'));
-    row.append(name, el('span', 'meta', `${formatSize(file.size)} · ${formatDate(file.modified)}`));
+    const actions = el('span', 'actions');
+    const download = el('a', 'button download', 'Download');
+    download.href = `/api/files/download?key=${encodeURIComponent(file.key)}`;
+    download.setAttribute('aria-label', `Download ${file.name}`);
+    const rename = el('button', null, 'Rename');
+    rename.type = 'button';
+    rename.setAttribute('aria-label', `Rename file ${file.name}`);
+    rename.addEventListener('click', () => renameFile(file));
+    const del = el('button', 'danger', 'Delete');
+    del.type = 'button';
+    del.setAttribute('aria-label', `Delete file ${file.name}`);
+    del.addEventListener('click', () => deleteFile(file));
+    actions.append(download, rename, del);
+    row.append(name, el('span', 'meta', `${formatSize(file.size)} · ${formatDate(file.modified)}`), actions);
     els.listing.append(row);
   }
 }
@@ -180,12 +204,14 @@ async function load() {
   renderBreadcrumbs(prefix);
   els.listing.replaceChildren();
   els.listing.dataset.prefix = prefix;
+  setUploadEnabled(false);
   setStatus('Loading…');
   try {
     const data = await api('GET', `/api/list?prefix=${encodeURIComponent(prefix)}`, undefined, controller.signal);
     if (seq !== loadSeq) return { stale: true };
     current = { prefix, folders: data.folders, files: data.files };
     renderListing();
+    setUploadEnabled(true);
     setStatus('');
     return { ok: true };
   } catch (err) {
@@ -276,6 +302,101 @@ async function deleteFolder(folder) {
   }
 }
 
+// Rename in place, or edit the path to move the file to another folder. The server validates `to`.
+async function renameFile(file) {
+  const to = prompt(`New name or path for "${file.name}":`, file.key);
+  if (to === null || to === file.key) return;
+  const nav = navigationToken();
+  try {
+    await api('POST', '/api/files/move', { from: file.key, to });
+    if (!nav.stillOn()) return; // D16
+    await reloadAndReport(nav, `Renamed "${file.name}" to "${to}".`);
+  } catch (err) {
+    if (!nav.stillOn()) return;
+    setStatus(err.message, true);
+  }
+}
+
+async function deleteFile(file) {
+  if (!confirm(`Delete file "${file.name}"?`)) return;
+  const nav = navigationToken();
+  try {
+    await api('DELETE', `/api/files?key=${encodeURIComponent(file.key)}`);
+    if (!nav.stillOn()) return; // D16: the user has moved on; leave the new folder's status alone
+    await reloadAndReport(nav, `Deleted file "${file.name}".`);
+  } catch (err) {
+    if (!nav.stillOn()) return;
+    setStatus(err.message, true);
+  }
+}
+
+// Uploads the chosen files into the folder shown when they were picked, one request per file, so each
+// has its own progress bar and result in the upload list. The list keeps every file's outcome, across
+// overlapping uploads and navigation; the folder's status line follows D16 like create/delete.
+async function uploadFiles() {
+  const files = [...els.uploadInput.files];
+  els.uploadInput.value = ''; // allow picking the same file again
+  if (files.length === 0 || els.uploadInput.disabled) return; // the folder on screen did not load
+  const prefix = current.prefix;
+  const nav = navigationToken();
+  const items = files.map((file) => {
+    const li = el('li');
+    li.dataset.state = 'uploading';
+    const progress = el('progress');
+    progress.max = 100;
+    progress.value = 0;
+    const result = el('span', 'result', 'Waiting…');
+    li.append(el('span', 'name', file.name), progress, result);
+    return { li, progress, result };
+  });
+  // Appended, never replaced: an earlier upload may still be running, and its status line may point at
+  // its rows ("see the list below"). The list lasts until the page is reloaded.
+  els.uploads.append(...items.map((i) => i.li));
+
+  let uploaded = 0;
+  for (const [i, file] of files.entries()) {
+    const { li, progress, result } = items[i];
+    result.textContent = 'Uploading…';
+    const outcome = await uploadOne(prefix, file, progress);
+    li.dataset.state = outcome.ok ? 'ok' : 'error';
+    result.textContent = outcome.ok ? 'Uploaded' : outcome.message;
+    if (outcome.ok) {
+      progress.value = 100;
+      uploaded += 1;
+    }
+  }
+  if (!nav.stillOn()) return; // D16
+  const failed = files.length - uploaded;
+  const text =
+    failed === 0
+      ? `Uploaded ${files.length === 1 ? `"${files[0].name}"` : `${files.length} files`}.`
+      : `Uploaded ${uploaded} of ${files.length} files; ${failed} failed (see the list below).`;
+  await reloadAndReport(nav, text, failed > 0);
+}
+
+// One file in one multipart request; XMLHttpRequest because fetch reports no upload progress.
+// Resolves to { ok: true } or { ok: false, message }.
+function uploadOne(prefix, file, progress) {
+  return new Promise((resolve) => {
+    const form = new FormData();
+    form.append('files', file, file.name);
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', `/api/files?prefix=${encodeURIComponent(prefix)}`);
+    xhr.responseType = 'json';
+    xhr.upload.addEventListener('progress', (event) => {
+      if (event.lengthComputable) progress.value = Math.floor((event.loaded / event.total) * 100);
+    });
+    xhr.addEventListener('load', () => {
+      if (xhr.status === 201) return resolve({ ok: true });
+      const error = xhr.response?.error;
+      resolve({ ok: false, message: error?.details?.files?.[0]?.error?.message ?? error?.message ?? `Upload failed (${xhr.status})` });
+    });
+    xhr.addEventListener('error', () => resolve({ ok: false, message: 'Upload failed: the connection was lost.' }));
+    xhr.send(form);
+  });
+}
+
+els.uploadInput.addEventListener('change', uploadFiles);
 els.newFolderForm.addEventListener('submit', createFolder);
 els.sort.addEventListener('change', renderListing);
 window.addEventListener('hashchange', () => {

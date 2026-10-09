@@ -22,6 +22,22 @@ export function parseFolderPath(input) {
   return prefix;
 }
 
+// Validates a file key from a client and returns it unchanged ('a/b.txt'). Unlike folder paths it
+// is never normalised: a trailing '/' would name a folder marker, so it is rejected.
+export function parseFileKey(input) {
+  if (typeof input !== 'string' || input === '') throw badRequest('A file key is required (a single string)');
+  if (input.endsWith('/')) throw badRequest('A file key must not end with "/"');
+  validateSegments(input);
+  if (Buffer.byteLength(input) > MAX_KEY_BYTES) throw badRequest('File key is too long');
+  return input;
+}
+
+// The folders a file key lives in, as file-style paths: 'a/b/c.txt' -> ['a', 'a/b'].
+export function ancestorPaths(key) {
+  const names = key.split('/').slice(0, -1);
+  return names.map((_, i) => names.slice(0, i + 1).join('/'));
+}
+
 // Last name in a non-root prefix: 'a/b/' -> 'b'.
 export function folderName(prefix) {
   return prefix.slice(0, -1).split('/').pop();

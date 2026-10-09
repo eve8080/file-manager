@@ -1,4 +1,3 @@
-import { createApp } from './app.js';
 import { loadConfig } from './config.js';
 import { start } from './start.js';
 import { createS3Storage } from './storage/s3.js';
@@ -12,4 +11,4 @@ try {
 }
 
 const storage = createS3Storage({ bucket: config.bucket, region: config.region });
-start(createApp({ storage }), config, `File manager (bucket "${config.bucket}")`);
+start(storage, config, `File manager (bucket "${config.bucket}")`);

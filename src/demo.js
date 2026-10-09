@@ -1,6 +1,5 @@
 // Runs the app with in-memory sample data, for trying the UI without AWS.
 // Everything is lost when the process exits.
-import { createApp } from './app.js';
 import { loadConfig } from './config.js';
 import { start } from './start.js';
 import { createMemoryStorage } from './storage/memory.js';
@@ -23,4 +22,4 @@ const storage = createMemoryStorage({
   'Empty folder/': '',
 });
 
-start(createApp({ storage }), config, 'DEMO file manager (in-memory, not saved)');
+start(storage, config, 'DEMO file manager (in-memory, not saved)');

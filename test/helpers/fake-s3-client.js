@@ -2,38 +2,135 @@ import {
   ListObjectsV2Command,
   PutObjectCommand,
   DeleteObjectsCommand,
+  DeleteObjectCommand,
+  HeadObjectCommand,
+  CopyObjectCommand,
+  CreateMultipartUploadCommand,
+  UploadPartCommand,
+  CompleteMultipartUploadCommand,
+  AbortMultipartUploadCommand,
+  S3Client,
 } from '@aws-sdk/client-s3';
 
 // Minimal in-process stand-in for S3Client, implementing just the commands the S3 driver uses,
-// with S3's listing semantics: sorted keys, Prefix, Delimiter/CommonPrefixes, MaxKeys pagination.
-// `pageSize` forces small pages so pagination is exercised; `failDeleteKeys` simulates per-key errors
-// (reported in the response's Errors); `throwOnDeleteCall: n` makes the n-th DeleteObjects request
-// throw before deleting anything (like a network error).
+// with S3's semantics where the driver depends on them:
+// - listing: sorted keys, Prefix, Delimiter/CommonPrefixes, MaxKeys pagination (`pageSize` forces small pages)
+// - HeadObject / CopyObject on a missing key: 404 `NotFound` / `NoSuchKey`
+// - PutObject / CompleteMultipartUpload with `IfNoneMatch: '*'` on an existing key: 412 `PreconditionFailed`
+// - multipart uploads: every part except the last must be at least `minPartSize` bytes (S3: 5 MiB), else
+//   CompleteMultipartUpload fails with `EntityTooSmall`; an unknown UploadId gives `NoSuchUpload`
+// Failure injection: `failDeleteKeys` / `throwOnDeleteCall` for DeleteObjects (see the M1 tests), and
+// `failNext(commandName, errorProps, times)` to make the next call(s) of any command throw an SDK-like error.
 export class FakeS3Client {
-  constructor(initial = {}, { pageSize = 1000, failDeleteKeys = [], failDeleteCode = 'AccessDenied', throwOnDeleteCall } = {}) {
-    this.objects = new Map();
+  constructor(
+    initial = {},
+    { pageSize = 1000, failDeleteKeys = [], failDeleteCode = 'AccessDenied', throwOnDeleteCall, minPartSize = 5 * 1024 * 1024 } = {},
+  ) {
+    this.objects = new Map(); // key -> { body: Buffer, modified: Date }
+    this.uploads = new Map(); // UploadId -> { key, parts: Map(partNumber -> Buffer) }
     this.pageSize = pageSize;
+    this.minPartSize = minPartSize;
     this.failDeleteKeys = new Set(failDeleteKeys);
     this.failDeleteCode = failDeleteCode;
     this.throwOnDeleteCall = throwOnDeleteCall;
     this.deleteCalls = 0;
     this.calls = [];
+    this.inputs = []; // { name, input } for every command
+    this.failures = []; // { name, props, times }
+    this.nextUploadId = 1;
     for (const [key, body] of Object.entries(initial)) this.put(key, body);
   }
 
   put(key, body = '', modified = new Date()) {
-    this.objects.set(key, { size: Buffer.byteLength(body), modified });
+    this.objects.set(key, { body: Buffer.from(body), modified });
+  }
+
+  body(key) {
+    return this.objects.get(key)?.body.toString();
+  }
+
+  failNext(name, props, times = 1) {
+    this.failures.push({ name, props, times });
   }
 
   async send(command) {
-    this.calls.push(command.constructor.name);
-    if (command instanceof ListObjectsV2Command) return this.#list(command.input);
+    const name = command.constructor.name;
+    this.calls.push(name);
+    this.inputs.push({ name, input: command.input });
+    const failure = this.failures.find((f) => f.name === name && f.times > 0);
+    if (failure) {
+      failure.times -= 1;
+      throw s3Error(failure.props.name, failure.props.status, failure.props.message);
+    }
+    const input = command.input;
+    if (command instanceof ListObjectsV2Command) return this.#list(input);
     if (command instanceof PutObjectCommand) {
-      this.put(command.input.Key, command.input.Body ?? '');
+      this.#precondition(input);
+      this.put(input.Key, toBuffer(input.Body));
+      return { ETag: '"etag"' };
+    }
+    if (command instanceof DeleteObjectsCommand) return this.#delete(input);
+    if (command instanceof HeadObjectCommand) {
+      const object = this.objects.get(input.Key);
+      if (!object) throw s3Error('NotFound', 404);
+      return { ContentLength: object.body.length, LastModified: object.modified };
+    }
+    if (command instanceof DeleteObjectCommand) {
+      this.objects.delete(input.Key); // like S3: deleting a missing key succeeds
       return {};
     }
-    if (command instanceof DeleteObjectsCommand) return this.#delete(command.input);
-    throw new Error(`FakeS3Client: unsupported command ${command.constructor.name}`);
+    if (command instanceof CopyObjectCommand) {
+      const [bucket, ...rest] = input.CopySource.split('/');
+      if (bucket !== input.Bucket) throw new Error(`FakeS3Client: CopySource bucket ${bucket} != ${input.Bucket}`);
+      const sourceKey = rest.map(decodeURIComponent).join('/');
+      const source = this.objects.get(sourceKey);
+      if (!source) throw s3Error('NoSuchKey', 404);
+      this.put(input.Key, source.body);
+      return { CopyObjectResult: { ETag: '"etag"' } };
+    }
+    if (command instanceof CreateMultipartUploadCommand) {
+      const UploadId = `upload-${this.nextUploadId++}`;
+      this.uploads.set(UploadId, { key: input.Key, parts: new Map() });
+      return { UploadId, Key: input.Key };
+    }
+    if (command instanceof UploadPartCommand) {
+      const upload = this.#upload(input);
+      if (!(input.PartNumber >= 1 && input.PartNumber <= 10_000)) throw s3Error('InvalidArgument', 400);
+      upload.parts.set(input.PartNumber, toBuffer(input.Body));
+      return { ETag: `"part-${input.PartNumber}"` };
+    }
+    if (command instanceof CompleteMultipartUploadCommand) {
+      const upload = this.#upload(input);
+      const parts = input.MultipartUpload?.Parts ?? [];
+      if (parts.length === 0) throw s3Error('MalformedXML', 400);
+      const buffers = parts.map(({ PartNumber, ETag }, i) => {
+        if (i > 0 && PartNumber <= parts[i - 1].PartNumber) throw s3Error('InvalidPartOrder', 400);
+        const part = upload.parts.get(PartNumber);
+        if (!part || ETag !== `"part-${PartNumber}"`) throw s3Error('InvalidPart', 400);
+        if (i < parts.length - 1 && part.length < this.minPartSize) throw s3Error('EntityTooSmall', 400);
+        return part;
+      });
+      this.#precondition(input);
+      this.uploads.delete(input.UploadId);
+      this.put(input.Key, Buffer.concat(buffers));
+      return { ETag: '"etag"' };
+    }
+    if (command instanceof AbortMultipartUploadCommand) {
+      this.#upload(input);
+      this.uploads.delete(input.UploadId);
+      return {};
+    }
+    throw new Error(`FakeS3Client: unsupported command ${name}`);
+  }
+
+  #upload({ UploadId, Key }) {
+    const upload = this.uploads.get(UploadId);
+    if (!upload || upload.key !== Key) throw s3Error('NoSuchUpload', 404);
+    return upload;
+  }
+
+  #precondition({ IfNoneMatch, Key }) {
+    if (IfNoneMatch === '*' && this.objects.has(Key)) throw s3Error('PreconditionFailed', 412);
   }
 
   #list({ Prefix = '', Delimiter, MaxKeys = 1000, ContinuationToken }) {
@@ -61,8 +158,8 @@ export class FakeS3Client {
       if (cut >= 0) {
         commonPrefixes.push({ Prefix: item });
       } else {
-        const { size, modified } = this.objects.get(key);
-        contents.push({ Key: key, Size: size, LastModified: modified });
+        const { body, modified } = this.objects.get(key);
+        contents.push({ Key: key, Size: body.length, LastModified: modified });
       }
       last = item;
     }
@@ -91,4 +188,23 @@ export class FakeS3Client {
     }
     return { Errors: errors.length ? errors : undefined };
   }
+}
+
+// A real S3Client used only for presigning, which is local computation. Its request handler throws, so any
+// attempt to send a request fails the test instead of reaching AWS. The credentials are dummies, not secrets.
+export const TEST_SIGNER = new S3Client({
+  region: 'us-east-1',
+  credentials: { accessKeyId: 'TESTACCESSKEYID', secretAccessKey: 'test-secret-not-a-real-key' },
+  requestHandler: { handle: () => Promise.reject(new Error('tests must never send requests to AWS')) },
+});
+
+// An error shaped like the SDK's: a name, a message, and $metadata.httpStatusCode.
+export function s3Error(name, status, message = `simulated ${name}`) {
+  return Object.assign(new Error(message), { name, $metadata: { httpStatusCode: status } });
+}
+
+function toBuffer(body) {
+  if (body === undefined) return Buffer.alloc(0);
+  if (typeof body === 'string' || Buffer.isBuffer(body) || body instanceof Uint8Array) return Buffer.from(body);
+  throw new Error('FakeS3Client: only string/Buffer bodies are supported (the driver buffers stream chunks)');
 }

@@ -87,10 +87,42 @@ input, select, button {
   color: var(--text);
 }
 button { cursor: pointer; }
+/* A link or label that looks and sizes like a button (Download, Upload files). */
+a.button,
+label.button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 44px;
+  min-width: 44px;
+  padding: 8px 12px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: var(--surface);
+}
 button[type="submit"] { background: var(--accent); border-color: var(--accent); color: #fff; }
 button.danger { color: var(--danger); }
 
+label.upload { cursor: pointer; color: var(--accent); }
+label.upload:focus-within { outline: 2px solid var(--accent); }
+label.upload.disabled { opacity: 0.5; cursor: not-allowed; }
+
 .status { min-height: 1.4em; margin: 4px 0 8px; color: var(--muted); }
+
+/* Per-file upload progress and results. */
+.uploads { list-style: none; margin: 0 0 8px; padding: 0; }
+.uploads:empty { display: none; }
+.uploads li {
+  display: grid;
+  grid-template-columns: 1fr minmax(80px, 30%);
+  gap: 2px 12px;
+  align-items: center;
+  padding: 6px 0;
+  overflow-wrap: anywhere;
+}
+.uploads progress { width: 100%; }
+.uploads .result { grid-column: 1 / -1; font-size: 0.875rem; color: var(--muted); }
+.uploads li[data-state="error"] .result { color: var(--danger); }
 .status.error { color: var(--danger); }
 
 .listing {
@@ -111,7 +143,8 @@ button.danger { color: var(--danger); }
   border-bottom: 1px solid var(--border);
 }
 .row:last-child { border-bottom: 0; }
-.row.file { grid-template-columns: 1fr auto; }
+.row.file { grid-template-columns: 1fr auto auto; }
+.row .actions { display: flex; flex-wrap: wrap; gap: 6px; justify-content: flex-end; }
 .row .name { overflow-wrap: anywhere; display: flex; gap: 8px; align-items: center; }
 .row a.name { min-height: 44px; min-width: 44px; align-self: stretch; }
 .row .icon { flex: none; }
@@ -122,6 +155,9 @@ button.danger { color: var(--danger); }
   .row { grid-template-columns: 1fr auto; }
   .row .meta { grid-column: 1; grid-row: 2; padding-left: 28px; }
   .row.folder .danger { grid-row: 1 / span 2; grid-column: 2; }
+  .row.file { grid-template-columns: 1fr; }
+  .row.file .meta { grid-row: auto; }
+  .row.file .actions { justify-content: flex-start; padding-left: 28px; }
 }
 
 .visually-hidden {

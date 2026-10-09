@@ -1,10 +1,13 @@
 import http from 'node:http';
+import { createApp } from './app.js';
 
 const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '::1']);
 
-// Starts the HTTP server and prints where it is reachable. Success is logged only on the
-// 'listening' event (Express 5's app.listen callback also runs on failure, so it isn't used).
-export function start(app, { host, port }, label) {
+// Builds the app from the config (both entry points share this, so settings such as MAX_UPLOAD_MB
+// are wired the same way), starts the HTTP server and prints where it is reachable. Success is logged
+// only on the 'listening' event (Express 5's app.listen callback also runs on failure, so it isn't used).
+export function start(storage, { host, port, maxUploadMb }, label) {
+  const app = createApp({ storage, maxUploadBytes: Math.floor(maxUploadMb * 1024 * 1024) });
   const address = `${host.includes(':') ? `[${host}]` : host}:${port}`;
   const server = http.createServer(app);
   server.once('listening', () => {

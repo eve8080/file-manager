@@ -14,12 +14,20 @@ If code and these documents disagree, stop and ask rather than silently picking 
 ## Architecture
 - Node.js (>= 22.9) + Express 5, ES modules, plain JavaScript, no build step
 - `src/server.js` — entry point (real S3); `src/demo.js` — in-memory demo, no AWS
-- `src/app.js` — Express app factory `createApp({ storage })`: API routes, host guard, security headers, error handler
+- `src/start.js` — `start(storage, config, label)`: builds the app (incl. `MAX_UPLOAD_MB`) for both entry points and listens
+- `src/app.js` — Express app factory `createApp({ storage, maxUploadBytes })`: API routes, host guard (D9),
+  cross-site write guard `sameOriginWrites` (D21), security headers, error handler, upload result reporting
+- `src/upload.js` — streams multipart uploads (busboy) into `storage.putFile`; per-file and per-request limits (D22),
+  malformed/cut-off bodies, client disconnects
+- `src/disposition.js` — `Content-Disposition: attachment` header for downloads
 - `src/config.js` — reads env (`.env` loaded via `node --env-file-if-exists`)
-- `src/paths.js` — validates/normalises every folder path and key before any storage call
-- `src/errors.js` — `AppError` (status + code + optional details); API errors are `{ "error": { "code", "message", "details"? } }`
-- `src/storage/` — storage interface: `s3.js` (AWS SDK v3, real), `memory.js` (tests/demo)
-- `public/` — static single page (vanilla JS); talks only to `/api/*`
+- `src/paths.js` — validates/normalises every folder path; file keys are validated exactly (`parseFileKey`)
+- `src/errors.js` — `AppError` (status + code + optional details); API errors are `{ "error": { "code", "message", "details"? } }`;
+  `toPublicError()` turns any error into its client-facing form
+- `src/storage/` — storage interface (documented in `memory.js`): list, folders, `putFile`/`getDownload`/`moveFile`/`deleteFile`.
+  `s3.js` (AWS SDK v3: multipart upload with abort-on-failure, presigned 5-minute downloads, copy-then-delete moves),
+  `memory.js` (tests/demo). Uploads/moves never overwrite (`FILE_EXISTS`) or collide with folder names (`NAME_CONFLICT`, D23)
+- `public/` — static single page (vanilla JS); talks only to `/api/*`. Uploads use one XHR per file (per-file progress)
 - `test/` — `node --test`; contract tests run against memory storage AND s3 storage with a fake S3 client;
   `test/browser.test.js` drives the UI in headless Chrome (`test/helpers/chrome.js`, no dependencies);
   `test/chrome-helper.test.js` tests that helper's process lifecycle with fake Chrome scripts;
@@ -36,8 +44,10 @@ If code and these documents disagree, stop and ask rather than silently picking 
 - Keep it small; no new frameworks, build tools, or dependencies without approval
 - Every storage/API change gets tests; new storage behaviour goes in the contract suite so both drivers are covered
 - Every UI behaviour change gets a browser regression test
-- The UI must ignore stale async responses: list loads (`load()`) and create/delete completions
-  (`navigationToken()`) in `public/app.js`
+- The UI must ignore stale async responses (`public/app.js`): list loads (`load()`, sequence number + abort; only the
+  current load may enable upload) and every mutation completion — folder create/delete, file upload/rename/delete —
+  checked with `navigationToken()` (D16: after navigation they never change the new folder's status; a partial
+  folder delete is alerted). The upload list keeps every file's result across overlapping uploads and navigation
 - Destructive bulk operations are confirmed server-side, not only in the browser
 - Never render user-controlled content as HTML in the frontend — use `textContent`
 - Validate all paths/keys server-side via `src/paths.js`

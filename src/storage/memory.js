@@ -1,4 +1,5 @@
-import { conflict, notFound } from '../errors.js';
+import { conflict, folderNameConflict, notFound, pathNameConflict } from '../errors.js';
+import { ancestorPaths } from '../paths.js';
 
 // In-memory storage with the same behaviour as the S3 driver. Used by tests and `npm run demo`.
 //
@@ -7,7 +8,16 @@ import { conflict, notFound } from '../errors.js';
 //                                        throws NOT_FOUND if prefix !== '' and nothing exists under it
 //   createFolder(prefix)              -> writes marker object `prefix`; throws FOLDER_EXISTS
 //   deleteFolder(prefix, {recursive}) -> number of objects deleted; throws NOT_FOUND / FOLDER_NOT_EMPTY
-// Prefixes are already validated by src/paths.js ('' or 'a/b/').
+//   deleteFile(key)                   -> deletes one file; throws NOT_FOUND
+//   putFile(key, stream)              -> { size }; stores a stream of unknown length; throws FILE_EXISTS
+//                                        (never overwrites) / NAME_CONFLICT (see moveFile); a stream error
+//                                        rejects and stores nothing
+//   getDownload(key)                 -> { url } (S3: presigned GET, 5 minutes) or { body } (memory);
+//                                        throws NOT_FOUND
+//   moveFile(from, to)               -> renames/moves one file; throws NOT_FOUND (from) / FILE_EXISTS (to) /
+//                                        NAME_CONFLICT (`to` is a folder's name, or part of its path is a file);
+//                                        S3 only: MOVE_INCOMPLETE if the copy exists but the source remains
+// Prefixes and keys are already validated by src/paths.js ('' or 'a/b/'; 'a/b.txt').
 export function createMemoryStorage(initial = {}) {
   const objects = new Map(); // key -> { body: Buffer, modified: Date }
 
@@ -17,6 +27,12 @@ export function createMemoryStorage(initial = {}) {
 
   function keysUnder(prefix) {
     return [...objects.keys()].filter((key) => key.startsWith(prefix));
+  }
+
+  // NAME_CONFLICT if `key` is a folder's name, or a part of its path is a file.
+  function checkNameFree(key) {
+    if (keysUnder(`${key}/`).length > 0) throw folderNameConflict();
+    if (ancestorPaths(key).some((path) => objects.has(path))) throw pathNameConflict();
   }
 
   for (const [key, body] of Object.entries(initial)) putObject(key, body);
@@ -60,6 +76,40 @@ export function createMemoryStorage(initial = {}) {
       }
       for (const key of keys) objects.delete(key);
       return keys.length;
+    },
+
+    async deleteFile(key) {
+      if (!objects.has(key)) throw notFound('File not found');
+      objects.delete(key);
+    },
+
+    // Like the S3 driver, refuses to overwrite: checked before reading and again before storing (the
+    // second check stands in for S3's conditional write, in case another upload won the race).
+    async putFile(key, stream) {
+      const exists = () => conflict('FILE_EXISTS', 'A file with that name already exists');
+      if (objects.has(key)) throw exists();
+      checkNameFree(key);
+      const chunks = [];
+      for await (const chunk of stream) chunks.push(chunk);
+      if (objects.has(key)) throw exists();
+      checkNameFree(key);
+      const body = Buffer.concat(chunks);
+      putObject(key, body);
+      return { size: body.length };
+    },
+
+    // The demo/test driver answers downloads itself, deterministically, with the file's bytes.
+    async getDownload(key) {
+      if (!objects.has(key)) throw notFound('File not found');
+      return { body: Buffer.from(objects.get(key).body) };
+    },
+
+    async moveFile(from, to) {
+      if (!objects.has(from)) throw notFound('File not found');
+      if (objects.has(to)) throw conflict('FILE_EXISTS', 'A file with that name already exists');
+      checkNameFree(to);
+      objects.set(to, objects.get(from));
+      objects.delete(from);
     },
   };
 }

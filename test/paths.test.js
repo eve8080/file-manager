@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { parseFolderPath, parsePrefix } from '../src/paths.js';
+import { parseFileKey, parseFolderPath, parsePrefix } from '../src/paths.js';
 
 describe('parsePrefix', () => {
   it('treats empty, missing, and "/" as the root', () => {
@@ -36,5 +36,25 @@ describe('parseFolderPath', () => {
     assert.throws(() => parseFolderPath(''), { status: 400 });
     assert.throws(() => parseFolderPath(undefined), { status: 400 });
     assert.equal(parseFolderPath('a/b'), 'a/b/');
+  });
+});
+
+describe('parseFileKey (M2)', () => {
+  it('accepts a file key exactly as given', () => {
+    assert.equal(parseFileKey('a.txt'), 'a.txt');
+    assert.equal(parseFileKey('Photos 2026/Été/beach.jpg'), 'Photos 2026/Été/beach.jpg');
+    assert.equal(parseFileKey('a\\b.txt'), 'a\\b.txt', 'a backslash is an ordinary character');
+  });
+
+  const bad = [undefined, '', ['a', 'b'], 42, 'a/', 'docs/', '/a', '../a', 'a/../b', 'a/./b', 'a//b', ' a', 'a ', 'a/ b',
+    'a\u0000b', 'a\nb', 'x'.repeat(1025)];
+  for (const input of bad) {
+    it(`rejects ${JSON.stringify(input)?.slice(0, 40)}`, () => {
+      assert.throws(() => parseFileKey(input), { status: 400, code: 'BAD_REQUEST' });
+    });
+  }
+
+  it('allows exactly 1024 bytes', () => {
+    assert.equal(parseFileKey('x'.repeat(1024)).length, 1024);
   });
 });

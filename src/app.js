@@ -1,12 +1,20 @@
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import express from 'express';
-import { AppError, STORAGE_REASONS, badRequest, classifyStorageError, isStorageError } from './errors.js';
-import { folderName, parseFolderPath, parsePrefix } from './paths.js';
+import { attachmentDisposition } from './disposition.js';
+import { badRequest, toPublicError } from './errors.js';
+import { folderName, parseFileKey, parseFolderPath, parsePrefix } from './paths.js';
+import { receiveUploads } from './upload.js';
 
 const PUBLIC_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'public');
+const DEFAULT_MAX_UPLOAD_BYTES = 100 * 1024 * 1024;
+// An upload request may carry the per-file limit's worth of data plus this much multipart framing
+// (boundaries and part headers), so a single file of exactly the limit always fits (decision D22).
+const UPLOAD_FRAMING_BYTES = 64 * 1024;
 
-export function createApp({ storage }) {
+// `maxUploadBytes` limits each uploaded file and, plus UPLOAD_FRAMING_BYTES, each upload request
+// (MAX_UPLOAD_MB from the config, default 100 MB).
+export function createApp({ storage, maxUploadBytes = DEFAULT_MAX_UPLOAD_BYTES }) {
   const app = express();
   app.disable('x-powered-by');
   app.use(hostGuard);
@@ -14,6 +22,7 @@ export function createApp({ storage }) {
   app.use(express.json({ limit: '10kb' }));
 
   const api = express.Router();
+  api.use(sameOriginWrites);
 
   api.get('/health', (req, res) => {
     res.json({ ok: true });
@@ -41,6 +50,46 @@ export function createApp({ storage }) {
     requireRecursiveConfirmation(prefix, recursive, queryParam(req, 'confirm'));
     const deleted = await storage.deleteFolder(prefix, { recursive });
     res.json({ path: prefix, deleted });
+  });
+
+  api.post('/files', async (req, res) => {
+    const prefix = parsePrefix(queryParam(req, 'prefix'));
+    const limits = { maxFileBytes: maxUploadBytes, maxRequestBytes: maxUploadBytes + UPLOAD_FRAMING_BYTES };
+    let received;
+    try {
+      received = await receiveUploads(req, { prefix, storage, ...limits });
+    } catch (err) {
+      if (['REQUEST_TOO_LARGE', 'MALFORMED_UPLOAD'].includes(err.code)) res.set('Connection', 'close'); // body left unread
+      throw err;
+    }
+    if (received.stopped) res.set('Connection', 'close');
+    sendUploadResults(res, received);
+  });
+
+  // S3: 302 to a 5-minute presigned URL. Memory/demo: the bytes themselves, so tests never touch AWS.
+  api.get('/files/download', async (req, res) => {
+    const key = parseFileKey(queryParam(req, 'key'));
+    const download = await storage.getDownload(key);
+    res.set('Cache-Control', 'no-store');
+    if (download.url) return res.redirect(302, download.url);
+    res.set({
+      'Content-Type': 'application/octet-stream',
+      'Content-Disposition': attachmentDisposition(key.split('/').pop()),
+    });
+    res.send(download.body);
+  });
+
+  api.post('/files/move', async (req, res) => {
+    const from = parseFileKey(req.body?.from);
+    const to = parseFileKey(req.body?.to);
+    await storage.moveFile(from, to);
+    res.json({ from, to });
+  });
+
+  api.delete('/files', async (req, res) => {
+    const key = parseFileKey(queryParam(req, 'key'));
+    await storage.deleteFile(key);
+    res.json({ key });
   });
 
   api.use((req, res) => {
@@ -106,6 +155,23 @@ function hostGuard(req, res, next) {
   sendError(res, 403, 'FORBIDDEN_HOST', 'Open this app by IP address or localhost');
 }
 
+// A multipart upload is a CORS "simple request", which a browser sends cross-site without a preflight,
+// so any web page could otherwise write into the bucket through the user's browser. Browsers always send
+// Origin on cross-site writes, so a write with a foreign (or "null") Origin is refused. The UI is
+// same-origin; the AI agent sends no Origin.
+function sameOriginWrites(req, res, next) {
+  const origin = req.headers.origin;
+  if (req.method === 'GET' || req.method === 'HEAD' || origin === undefined) return next();
+  let host;
+  try {
+    host = new URL(origin).host;
+  } catch {
+    host = undefined; // e.g. "null" from a sandboxed frame or file:// page
+  }
+  if (host !== undefined && host === req.headers.host) return next();
+  sendError(res, 403, 'FORBIDDEN_ORIGIN', 'Cross-site requests are not allowed');
+}
+
 function securityHeaders(req, res, next) {
   res.set({
     'Content-Security-Policy':
@@ -122,15 +188,41 @@ function sendError(res, status, code, message, details) {
 
 // Express recognises error handlers by their 4-argument signature, so `next` must stay.
 function errorHandler(err, req, res, next) {
-  if (err instanceof AppError) return sendError(res, err.status, err.code, err.message, err.details);
   if (err.type === 'entity.parse.failed') return sendError(res, 400, 'BAD_REQUEST', 'Invalid JSON body');
   if (err.type === 'entity.too.large') return sendError(res, 413, 'TOO_LARGE', 'Request body too large');
-
-  console.error(err); // full details stay server-side
   // Storage errors: clients get a fixed classification, never the SDK's name or message.
-  if (isStorageError(err)) {
-    const reason = classifyStorageError(err);
-    return sendError(res, 502, 'STORAGE_ERROR', STORAGE_REASONS[reason], { reason });
-  }
-  sendError(res, 500, 'INTERNAL_ERROR', 'Internal server error');
+  const { status, code, message, details } = toPublicError(err);
+  sendError(res, status, code, message, details);
+}
+
+// One result per uploaded file. All stored → 201 { files }. Otherwise an error listing every file:
+// UPLOAD_FAILED (none stored) or UPLOAD_INCOMPLETE (some stored), with the failures' common status
+// if they share one, else 502 if any is a server/storage failure, else 400. If reading stopped early
+// (`stopped`: a malformed or cut-off body, or the request limit), that counts as a failure even if every
+// file before it was stored, and is reported as `details.malformed` or `details.requestTooLarge`.
+function sendUploadResults(res, { results, stopped }) {
+  const files = results.map(({ name, key, ok, size, error }) =>
+    ok ? { name, key, ok, size } : { name, ...(key === undefined ? {} : { key }), ok: false, error: toPublicError(error) },
+  );
+  const failures = files.filter((f) => !f.ok);
+  if (failures.length === 0 && !stopped) return res.status(201).json({ files });
+  const statuses = new Set(failures.map((f) => f.error.status));
+  if (stopped) statuses.add(stopped.status);
+  const status = statuses.size === 1 ? [...statuses][0] : [...statuses].some((s) => s >= 500) ? 502 : 400;
+  for (const f of failures) delete f.error.status;
+  const uploaded = files.length - failures.length;
+  sendError(
+    res,
+    status,
+    uploaded === 0 ? 'UPLOAD_FAILED' : 'UPLOAD_INCOMPLETE',
+    `${failures.length} of ${files.length} files could not be uploaded.`,
+    {
+      uploaded,
+      failed: failures.length,
+      files,
+      ...(stopped && {
+        [stopped.code === 'MALFORMED_UPLOAD' ? 'malformed' : 'requestTooLarge']: { code: stopped.code, message: stopped.message },
+      }),
+    },
+  );
 }
