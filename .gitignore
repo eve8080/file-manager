@@ -1,0 +1,37 @@
+# Secrets and local environment
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Dependencies
+node_modules/
+.venv/
+venv/
+
+# Build, coverage, caches, and logs
+dist/
+build/
+coverage/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+__pycache__/
+*.py[cod]
+*.log
+
+# Local tools and OS
+.DS_Store
+.claude/settings.local.json
+
+# Editors / temp
+.idea/
+.vscode/
+*.swp
+tmp/
+*.tmp
+
+# Local databases (none planned; defensive)
+*.sqlite
+*.db

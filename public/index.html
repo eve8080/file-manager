@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>File Manager</title>
+  <link rel="stylesheet" href="style.css">
+  <script type="module" src="app.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <h1>File Manager</h1>
+  </header>
+  <main>
+    <nav id="breadcrumbs" class="breadcrumbs" aria-label="Folder path"></nav>
+
+    <div class="toolbar">
+      <form id="new-folder-form" class="new-folder">
+        <label class="visually-hidden" for="new-folder-name">New folder name</label>
+        <input id="new-folder-name" name="name" placeholder="New folder name" required maxlength="255" autocomplete="off">
+        <button type="submit">Create folder</button>
+      </form>
+      <label class="sort">
+        <span>Sort</span>
+        <select id="sort">
+          <option value="name-asc">Name A–Z</option>
+          <option value="name-desc">Name Z–A</option>
+          <option value="modified-desc">Newest first</option>
+          <option value="modified-asc">Oldest first</option>
+          <option value="size-desc">Largest first</option>
+          <option value="size-asc">Smallest first</option>
+        </select>
+      </label>
+    </div>
+
+    <p id="status" class="status" role="status" aria-live="polite"></p>
+    <ul id="listing" class="listing"></ul>
+  </main>
+</body>
+</html>

@@ -1,0 +1,19 @@
+{
+  "name": "s3-file-manager",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Personal web file manager for a private S3 bucket",
+  "type": "module",
+  "engines": {
+    "node": ">=22.9"
+  },
+  "scripts": {
+    "start": "node --env-file-if-exists=.env src/server.js",
+    "demo": "node --env-file-if-exists=.env src/demo.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.1147.0",
+    "express": "^5.2.1"
+  }
+}
