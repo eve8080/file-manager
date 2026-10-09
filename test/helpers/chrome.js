@@ -1,6 +1,6 @@
 // Tiny headless-Chrome driver for browser regression tests, using the Chrome DevTools Protocol over
-// Node's built-in WebSocket (no extra dependencies). Chrome runs with a throwaway profile and
-// background networking disabled. Set CHROME_PATH to use a specific Chrome/Chromium binary.
+// Node's built-in WebSocket (no extra dependencies). Chrome runs with a throwaway profile, background
+// networking disabled and no host name resolution. Set CHROME_PATH to use a specific Chrome/Chromium binary.
 //
 // Lifecycle guarantees (tested in test/chrome-helper.test.js with fake Chrome executables):
 // - startup is bounded; on timeout or early failure the process group is killed and the profile removed
@@ -87,6 +87,9 @@ export async function startChromeProcess(executable, options = {}) {
       '--disable-component-update',
       '--disable-sync',
       '--disable-extensions',
+      // No host name resolves, so the browser can only reach the local test server (127.0.0.1), never
+      // the network (e.g. a presigned S3 URL that a test forgot to intercept).
+      '--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE 127.0.0.1',
       'about:blank',
     ],
     { stdio: ['ignore', 'ignore', 'pipe'], detached: true },

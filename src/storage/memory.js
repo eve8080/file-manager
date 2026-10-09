@@ -1,5 +1,6 @@
 import { conflict, folderNameConflict, notFound, pathNameConflict } from '../errors.js';
 import { ancestorPaths } from '../paths.js';
+import { previewKind, textPreview } from '../preview.js';
 
 // In-memory storage with the same behaviour as the S3 driver. Used by tests and `npm run demo`.
 //
@@ -14,6 +15,11 @@ import { ancestorPaths } from '../paths.js';
 //                                        rejects and stores nothing
 //   getDownload(key)                 -> { url } (S3: presigned GET, 5 minutes) or { body } (memory);
 //                                        throws NOT_FOUND
+//   getPreview(key)                  -> by extension (src/preview.js); throws NOT_FOUND for any kind:
+//                                        { kind: 'text', text, truncated } (first PREVIEW_TEXT_BYTES, UTF-8)
+//                                        { kind: 'image'|'pdf', contentType, url } (S3: presigned inline GET,
+//                                        5 minutes) or { kind, contentType, body } (memory)
+//                                        { kind: 'none' } (download only)
 //   moveFile(from, to)               -> renames/moves one file; throws NOT_FOUND (from) / FILE_EXISTS (to) /
 //                                        NAME_CONFLICT (`to` is a folder's name, or part of its path is a file);
 //                                        S3 only: MOVE_INCOMPLETE if the copy exists but the source remains
@@ -102,6 +108,15 @@ export function createMemoryStorage(initial = {}) {
     async getDownload(key) {
       if (!objects.has(key)) throw notFound('File not found');
       return { body: Buffer.from(objects.get(key).body) };
+    },
+
+    async getPreview(key) {
+      if (!objects.has(key)) throw notFound('File not found');
+      const preview = previewKind(key);
+      const { body } = objects.get(key);
+      if (preview.kind === 'text') return textPreview(body, body.length);
+      if (preview.kind === 'none') return preview;
+      return { ...preview, body: Buffer.from(body) };
     },
 
     async moveFile(from, to) {

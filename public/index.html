@@ -41,5 +41,15 @@
     <ul id="uploads" class="uploads" aria-label="Uploads"></ul>
     <ul id="listing" class="listing"></ul>
   </main>
+
+  <dialog id="preview" class="preview" aria-labelledby="preview-title">
+    <div class="preview-bar">
+      <h2 id="preview-title" class="preview-title"></h2>
+      <a id="preview-download" class="button download">Download</a>
+      <button id="preview-close" type="button">Close</button>
+    </div>
+    <p id="preview-message" class="preview-message" role="status" aria-live="polite"></p>
+    <div id="preview-body" class="preview-body"></div>
+  </dialog>
 </body>
 </html>

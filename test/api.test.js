@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import { createApp, isAllowedHost } from '../src/app.js';
 import { STORAGE_REASONS } from '../src/errors.js';
+import { PREVIEW_TEXT_BYTES } from '../src/preview.js';
 import { createMemoryStorage } from '../src/storage/memory.js';
 import { createS3Storage } from '../src/storage/s3.js';
 import { FakeS3Client, TEST_SIGNER } from './helpers/fake-s3-client.js';
@@ -417,6 +418,134 @@ describe('GET /api/files/download (M2)', () => {
     // HeadObject's 404 for a missing bucket must not be mistaken for a missing file.
     assert.equal(res.status, 502);
     assert.deepEqual(res.body.error.details, { reason: 'BUCKET_NOT_FOUND' });
+  });
+});
+
+describe('GET /api/files/preview (M3)', () => {
+  const preview = (key) => call('GET', `/api/files/preview?key=${encodeURIComponent(key)}`);
+
+  it('text: { kind, text, truncated } with the raw characters, not cached', async () => {
+    const html = '<script>alert(1)</script><b onclick="x()">bold</b> &amp;';
+    storage.putObject('docs/page.html', html);
+    const res = await preview('docs/page.html');
+    assert.equal(res.status, 200);
+    assert.deepEqual(res.body, { kind: 'text', text: html, truncated: false });
+    assert.match(res.headers.get('content-type'), /^application\/json/);
+    assert.equal(res.headers.get('cache-control'), 'no-store');
+  });
+
+  it('text: exactly 1 MiB is whole; 1 MiB + 1 byte is truncated to 1 MiB', async () => {
+    storage.putObject('exact.txt', 'a'.repeat(PREVIEW_TEXT_BYTES));
+    storage.putObject('over.txt', `${'a'.repeat(PREVIEW_TEXT_BYTES)}b`);
+    const exact = await preview('exact.txt');
+    assert.deepEqual([exact.body.text.length, exact.body.truncated], [PREVIEW_TEXT_BYTES, false]);
+    const over = await preview('over.txt');
+    assert.deepEqual([over.body.kind, over.body.text.length, over.body.truncated], ['text', PREVIEW_TEXT_BYTES, true]);
+    assert.ok(!over.body.text.includes('b'));
+  });
+
+  it('memory/demo image and PDF: a local same-origin URL (never AWS)', async () => {
+    storage.putObject('docs/Été 1.png', 'png');
+    storage.putObject('docs/r.pdf', 'pdf');
+    assert.deepEqual((await preview('docs/Été 1.png')).body, {
+      kind: 'image',
+      url: `/api/files/preview/content?key=${encodeURIComponent('docs/Été 1.png')}`,
+    });
+    assert.deepEqual((await preview('docs/r.pdf')).body, { kind: 'pdf', url: '/api/files/preview/content?key=docs%2Fr.pdf' });
+  });
+
+  it('S3 image and PDF: the presigned 5-minute inline URL', async () => {
+    storage = createS3Storage({ bucket: 'test', client: new FakeS3Client({ 'p.jpg': 'j', 'd.pdf': 'p' }), signingClient: TEST_SIGNER });
+    for (const [key, kind, type] of [['p.jpg', 'image', 'image/jpeg'], ['d.pdf', 'pdf', 'application/pdf']]) {
+      const res = await preview(key);
+      assert.equal(res.status, 200);
+      assert.deepEqual(Object.keys(res.body).sort(), ['kind', 'url']);
+      assert.equal(res.body.kind, kind);
+      const url = new URL(res.body.url);
+      assert.equal(url.hostname, 'test.s3.us-east-1.amazonaws.com');
+      assert.equal(url.searchParams.get('X-Amz-Expires'), '300');
+      assert.equal(url.searchParams.get('response-content-type'), type);
+    }
+  });
+
+  it('other types: { kind: "none" } only (the UI offers download)', async () => {
+    storage.putObject('a.zip', 'zip');
+    assert.deepEqual((await preview('a.zip')).body, { kind: 'none' });
+  });
+
+  it('404 for a missing file or a folder name; 400 for bad keys', async () => {
+    for (const key of ['docs/nope.txt', 'docs/nope.png', 'docs']) {
+      const res = await preview(key);
+      assert.equal(res.status, 404, key);
+      assert.equal(res.body.error.code, 'NOT_FOUND');
+    }
+    for (const query of ['', 'key=', 'key=docs/', 'key=../a.txt', 'key=%2Fa.txt', 'key=a//b', 'key=a%01b', 'key=a&key=b', 'key[a]=docs/a.txt']) {
+      const res = await call('GET', `/api/files/preview?${query}`);
+      assert.equal(res.status, 400, query);
+      assert.equal(res.body.error.code, 'BAD_REQUEST', query);
+    }
+  });
+
+  it('S3 failures are a fixed STORAGE_ERROR reason; raw details only in the server log', async () => {
+    for (const [command, props, reason] of [
+      ['HeadObjectCommand', { name: 'NoSuchBucket', status: 404 }, 'BUCKET_NOT_FOUND'],
+      ['GetObjectCommand', { name: 'AccessDenied', status: 403 }, 'ACCESS_DENIED'],
+    ]) {
+      const client = new FakeS3Client({ 'a.txt': 'A' });
+      client.failNext(command, { ...props, message: 'secret internal detail' });
+      storage = createS3Storage({ bucket: 'test', client, signingClient: TEST_SIGNER });
+      let res;
+      const logged = await quietly(async () => {
+        res = await preview('a.txt');
+      });
+      assert.equal(res.status, 502, command);
+      assert.deepEqual(res.body.error, { code: 'STORAGE_ERROR', message: STORAGE_REASONS[reason], details: { reason } });
+      assert.ok(!JSON.stringify(res.body).includes('secret internal detail'));
+      assert.match(String(logged[0]?.[0]?.message), /secret internal detail/);
+    }
+  });
+});
+
+describe('GET /api/files/preview/content (M3, the memory/demo preview URL)', () => {
+  const get = (query) => fetch(`${baseUrl}/api/files/preview/content?${query}`, { redirect: 'manual' });
+
+  it('memory: the bytes inline, with the content type of the extension, framable only by this app', async () => {
+    storage.putObject('docs/Été.PNG', '<html><script>alert(1)</script></html>'); // content is never trusted
+    storage.putObject('docs/r.pdf', '%PDF-1.4');
+    for (const [key, type] of [['docs/Été.PNG', 'image/png'], ['docs/r.pdf', 'application/pdf']]) {
+      const res = await get(`key=${encodeURIComponent(key)}`);
+      assert.equal(res.status, 200, key);
+      assert.equal(res.headers.get('content-type'), type);
+      assert.equal(res.headers.get('x-content-type-options'), 'nosniff');
+      assert.match(res.headers.get('content-disposition'), /^inline; filename="/);
+      assert.equal(res.headers.get('cache-control'), 'no-store');
+      assert.equal(res.headers.get('content-security-policy'), "default-src 'none'; frame-ancestors 'self'");
+      assert.equal(await res.text(), (await storage.getPreview(key)).body.toString());
+    }
+  });
+
+  it('S3: 302 to the presigned inline URL', async () => {
+    storage = createS3Storage({ bucket: 'test', client: new FakeS3Client({ 'd.pdf': 'p' }), signingClient: TEST_SIGNER });
+    const res = await get('key=d.pdf');
+    assert.equal(res.status, 302);
+    assert.equal(res.headers.get('cache-control'), 'no-store');
+    const url = new URL(res.headers.get('location'));
+    assert.equal(url.hostname, 'test.s3.us-east-1.amazonaws.com');
+    assert.equal(url.searchParams.get('response-content-type'), 'application/pdf');
+  });
+
+  it('text and other types have no inline content (400); 404 for a missing file; 400 for bad keys', async () => {
+    storage.putObject('page.html', '<script>alert(1)</script>');
+    storage.putObject('a.zip', 'zip');
+    for (const key of ['page.html', 'readme.txt', 'a.zip']) {
+      const res = await get(`key=${key}`);
+      assert.equal(res.status, 400, key);
+      assert.equal((await res.json()).error.code, 'BAD_REQUEST');
+    }
+    assert.equal((await get('key=docs/nope.png')).status, 404);
+    for (const query of ['', 'key=docs/', 'key=../a.png', 'key=a&key=b', 'key[a]=x.png']) {
+      assert.equal((await get(query)).status, 400, query);
+    }
   });
 });
 
@@ -973,6 +1102,17 @@ describe('errors and hardening', () => {
     assert.match(res.headers.get('content-security-policy'), /default-src 'self'/);
     assert.equal(res.headers.get('x-content-type-options'), 'nosniff');
     assert.equal(res.headers.get('x-powered-by'), null);
+  });
+
+  it('M3: the page CSP lets images and frames load from S3 presigned URLs, and nothing else from outside', async () => {
+    const csp = (await fetch(`${baseUrl}/`)).headers.get('content-security-policy');
+    const directives = Object.fromEntries(csp.split(';').map((d) => d.trim().split(/\s+/)).map(([name, ...values]) => [name, values]));
+    assert.deepEqual(directives['default-src'], ["'self'"]);
+    assert.deepEqual(directives['img-src'], ["'self'", 'https://*.amazonaws.com']);
+    assert.deepEqual(directives['frame-src'], ["'self'", 'https://*.amazonaws.com']);
+    assert.deepEqual(directives['object-src'], ["'none'"]);
+    assert.deepEqual(directives['frame-ancestors'], ["'none'"]);
+    assert.equal(directives['script-src'], undefined, 'scripts stay same-origin (default-src)');
   });
 
   it('rejects requests with a domain-name Host header (DNS rebinding)', async () => {

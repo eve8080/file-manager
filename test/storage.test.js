@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { Readable } from 'node:stream';
 import { ListObjectsV2Command } from '@aws-sdk/client-s3';
+import { PREVIEW_TEXT_BYTES } from '../src/preview.js';
 import { createMemoryStorage } from '../src/storage/memory.js';
 import { createS3Storage } from '../src/storage/s3.js';
 import { FakeS3Client, TEST_SIGNER } from './helpers/fake-s3-client.js';
@@ -212,6 +213,74 @@ for (const [name, make] of Object.entries(drivers)) {
       assert.equal(url.searchParams.get('X-Amz-Algorithm'), 'AWS4-HMAC-SHA256');
       assert.match(url.searchParams.get('X-Amz-Signature'), /^[0-9a-f]{64}$/);
       assert.equal(url.searchParams.get('response-content-disposition'), `attachment; filename="two.txt"; filename*=UTF-8''two.txt`);
+    });
+
+    // ---- M3: preview ----
+
+    it('preview text: a small text file is returned whole, not truncated', async () => {
+      assert.deepEqual(await make(SAMPLE).getPreview('a/two.txt'), { kind: 'text', text: '22', truncated: false });
+      assert.deepEqual(await make({ 'e.txt': '' }).getPreview('e.txt'), { kind: 'text', text: '', truncated: false });
+    });
+
+    it('preview text: HTML is returned as the raw characters, unchanged', async () => {
+      const html = '<script>window.pwned = 1</script><img src=x onerror="alert(1)">&amp; "quotes"';
+      assert.deepEqual(await make({ 'page.html': html }).getPreview('page.html'), { kind: 'text', text: html, truncated: false });
+    });
+
+    it('preview text: exactly 1 MiB is whole; one byte more is truncated to the first 1 MiB', async () => {
+      const exact = 'a'.repeat(PREVIEW_TEXT_BYTES);
+      assert.deepEqual(await make({ 'x.txt': exact }).getPreview('x.txt'), { kind: 'text', text: exact, truncated: false });
+      const over = await make({ 'x.txt': `${exact}b` }).getPreview('x.txt');
+      assert.equal(over.truncated, true);
+      assert.equal(over.text, exact);
+    });
+
+    it('preview text: a multi-byte character cut by the 1 MiB limit is dropped, not shown broken', async () => {
+      const body = `${'a'.repeat(PREVIEW_TEXT_BYTES - 1)}é and more`; // "é" is 2 bytes and straddles the limit
+      const preview = await make({ 'x.txt': body }).getPreview('x.txt');
+      assert.equal(preview.truncated, true);
+      assert.equal(preview.text, 'a'.repeat(PREVIEW_TEXT_BYTES - 1));
+      assert.ok(!preview.text.includes('�'));
+      assert.equal((await make({ 'u.txt': 'Été 🌍 ok' }).getPreview('u.txt')).text, 'Été 🌍 ok');
+    });
+
+    it('preview image/pdf: memory gives the bytes and a fixed content type; S3 a presigned inline GET URL valid for exactly 5 minutes', async () => {
+      const storage = make({ 'pics/Été 1.PNG': 'png-bytes', 'docs/r.pdf': 'pdf-bytes', 'p.webp': 'w' });
+      for (const [key, kind, contentType, bytes] of [
+        ['pics/Été 1.PNG', 'image', 'image/png', 'png-bytes'],
+        ['docs/r.pdf', 'pdf', 'application/pdf', 'pdf-bytes'],
+        ['p.webp', 'image', 'image/webp', 'w'],
+      ]) {
+        const preview = await storage.getPreview(key);
+        if (name === 'memory') {
+          assert.deepEqual(preview, { kind, contentType, body: Buffer.from(bytes) }, key);
+          continue;
+        }
+        assert.deepEqual(Object.keys(preview).sort(), ['contentType', 'kind', 'url'], key);
+        assert.equal(preview.kind, kind);
+        assert.equal(preview.contentType, contentType);
+        const url = new URL(preview.url);
+        assert.equal(url.protocol, 'https:');
+        assert.equal(url.hostname, 'test-bucket.s3.us-east-1.amazonaws.com');
+        assert.equal(decodeURIComponent(url.pathname), `/${key}`);
+        assert.equal(url.searchParams.get('X-Amz-Expires'), '300');
+        assert.match(url.searchParams.get('X-Amz-Signature'), /^[0-9a-f]{64}$/);
+        // The type comes from the extension (uploads store no content type), and the browser shows it inline.
+        assert.equal(url.searchParams.get('response-content-type'), contentType);
+        assert.match(url.searchParams.get('response-content-disposition'), /^inline; filename="/);
+      }
+    });
+
+    it('preview: other types are kind "none" (download only), with nothing else', async () => {
+      const storage = make({ 'a.zip': 'zip', 'Makefile': 'all:', 'x.svgz': 's' });
+      for (const key of ['a.zip', 'Makefile', 'x.svgz']) assert.deepEqual(await storage.getPreview(key), { kind: 'none' }, key);
+    });
+
+    it('preview: a missing file, or a folder name, is NOT_FOUND (whatever its kind)', async () => {
+      const storage = make(SAMPLE);
+      for (const key of ['a/missing.txt', 'a/missing.png', 'a/missing.pdf', 'a/missing.zip', 'empty', 'a/sub']) {
+        await assert.rejects(storage.getPreview(key), { status: 404, code: 'NOT_FOUND' }, key);
+      }
     });
   });
 }
@@ -473,6 +542,38 @@ describe('s3 driver specifics', () => {
     const { client, storage } = streamingS3();
     client.failNext('PutObjectCommand', { name: 'PreconditionFailed', status: 412 });
     await assert.rejects(storage.putFile('s.txt', Readable.from([bytes(3)])), { status: 409, code: 'FILE_EXISTS' });
+  });
+
+  // ---- M3: preview ----
+
+  it('preview: a text file costs one HEAD and one GET ranged to the first 1 MiB; an empty file or an image no GET', async () => {
+    const client = new FakeS3Client({ 'big.txt': 'x'.repeat(PREVIEW_TEXT_BYTES + 10), 'e.txt': '', 'p.png': 'p' });
+    const storage = createS3Storage({ bucket: 'b', client, signingClient: TEST_SIGNER });
+    const big = await storage.getPreview('big.txt');
+    assert.deepEqual([big.text.length, big.truncated], [PREVIEW_TEXT_BYTES, true]);
+    assert.deepEqual(client.calls, ['HeadObjectCommand', 'GetObjectCommand']);
+    assert.equal(client.inputs[1].input.Range, 'bytes=0-1048575');
+    client.calls.length = 0;
+    await storage.getPreview('e.txt');
+    await storage.getPreview('p.png'); // presigning is local; TEST_SIGNER refuses to send anything
+    assert.deepEqual(client.calls, ['HeadObjectCommand', 'HeadObjectCommand']);
+  });
+
+  it('preview: a file deleted between the HEAD and the GET is NOT_FOUND, not a storage error', async () => {
+    const client = new FakeS3Client({ 'a.txt': 'A' });
+    client.failNext('GetObjectCommand', { name: 'NoSuchKey', status: 404 });
+    await assert.rejects(createS3Storage({ bucket: 'b', client }).getPreview('a.txt'), { status: 404, code: 'NOT_FOUND' });
+  });
+
+  it('preview: S3 failures reach the caller as the SDK error (the API turns them into fixed reasons)', async () => {
+    const client = new FakeS3Client({ 'a.txt': 'A', 'p.png': 'p' });
+    const storage = createS3Storage({ bucket: 'b', client, signingClient: TEST_SIGNER });
+    client.failNext('HeadObjectCommand', { name: 'AccessDenied', status: 403 });
+    await assert.rejects(storage.getPreview('p.png'), { name: 'AccessDenied' });
+    client.failNext('HeadObjectCommand', { name: 'NoSuchBucket', status: 404 }); // a missing bucket is not a missing file
+    await assert.rejects(storage.getPreview('a.txt'), { name: 'NoSuchBucket' });
+    client.failNext('GetObjectCommand', { name: 'SlowDown', status: 503 });
+    await assert.rejects(storage.getPreview('a.txt'), { name: 'SlowDown' });
   });
 
   // ---- M2: move is copy-then-delete on S3 ----

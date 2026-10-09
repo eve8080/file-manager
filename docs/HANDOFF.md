@@ -1,184 +1,128 @@
 # Handoff
 
-_Last updated: 2026-10-09. M1 is committed (`1fa3d1b`) and passed review (its history is in that commit's
-`docs/HANDOFF.md`). **M2 is implemented, independently re-reviewed (PASS, `docs/CLAUDE_REVIEW.md`), and the review's approved
-follow-ups F1–F4 plus D21–D23 and the `CLAUDE.md` update are done**, uncommitted. Stopped before commit, push,
-deployment and M3._
+_Last updated: 2026-10-09. M1 (`1fa3d1b`) and M2 (`d4d6b50`) are committed and reviewed; their session
+histories are in those commits' `docs/HANDOFF.md`. **M3 (preview) implementation and verification evidence is
+recorded below.** The authoritative independent-review verdict is `docs/CLAUDE_REVIEW.md`._
 
 ## Status
-- **M2 acceptance criteria:** all implemented, each with tests (see "M2 acceptance criteria" below).
-- **Review follow-ups:** F1 name collisions, F2 total request limit, F3 overlapping uploads, F4 no upload after a
-  failed folder load, all test-first (see "Review follow-ups"). D21 (`sameOriginWrites`), D22 (request limit)
-  and D23 (collisions) are recorded in `IMPLEMENTATION_BRIEF.md`; `CLAUDE.md` is updated (authorised by Mr. So).
-- `npm test`: **317/317 pass, 0 skipped** (285 at the M2 review).
-- **Quota checkpoint resolved:** the previous session stopped on a hanging test ("invalid names"). Root cause:
-  a raw control character in a multipart *header* is malformed framing, and `receiveUploads` had no parser
-  `'error'` handler, so the request never settled. See the "Checkpoint resolution" and S12d rows.
-- **Found and fixed during M2** (each with its own RED): a server crash when the size limit tripped before S3
-  started reading (S12b); `NoSuchBucket` misreported as a missing file (S8); exactly-at-limit files rejected
-  (S12b); client disconnects leaving S3 multipart uploads open (S12e); `MAX_UPLOAD_MB` not wired into the
-  running app (S12g); cross-site uploads through the user's browser (X1).
+- **M3 acceptance criteria:** all implemented test-first (see "M3 acceptance criteria → evidence").
+- `npm test`: **377/377 pass, 0 skipped** (317 before M3).
+- Fresh read-only Claude review `3e5422ad-d5a3-4d61-b368-ca36ed32f760`: **PASS**, no blocking findings.
+- The review's documentation findings are corrected in this snapshot. A post-correction review attempt stopped at Claude's
+  usage limit before a verdict; Mr. So explicitly requested commit and push, so the pushed commit retains this fact and
+  may receive a follow-up review without history rewriting.
+- New decision **D24** in `IMPLEMENTATION_BRIEF.md` (preview kinds, 1 MiB cap, presigned inline URLs, the
+  memory/demo content route, the CSP change). No new dependency; `package.json`/lockfile unchanged.
+- `CLAUDE.md` records the M3 architecture and stale-preview rules.
 
-## M2 approvals (2026-10-09, given in the M2 resume instruction)
-1. **Approved:** add `@aws-sdk/s3-request-presigner` and keep the brief's 302 redirect to a presigned download URL
-   with a 5-minute expiry.
-2. **Approved:** add `busboy` and keep multipart, multi-file, streamed uploads. S3 streams of unknown size use the
-   multipart-upload commands already in `@aws-sdk/client-s3`, with abort-on-failure cleanup.
+## M3 slice log (strict red → green, recorded as it happened)
+Baseline before any M3 change (HEAD `d4d6b50`, clean tree): `npm test` → 317 tests, 317 pass, 0 skipped.
 
-Installed with `npm install @aws-sdk/s3-request-presigner@3.1147.0 busboy`: `@aws-sdk/s3-request-presigner@3.1147.0`
-(the same version as `@aws-sdk/client-s3`) and `busboy@1.6.0`. The lockfile gained exactly 3 packages: those two
-plus `streamsearch` (busboy's only dependency). npm reported "found 0 vulnerabilities" as part of the install.
-
-## M2 slice log (strict red → green, one behaviour at a time)
 | Slice | RED command and result | GREEN result |
 |---|---|---|
-| S1 `parseFileKey` (`src/paths.js`) | `node --test test/paths.test.js` → **1 fail**: `SyntaxError: … does not provide an export named 'parseFileKey'` | 33/33 pass |
-| (test infra) fake S3: bodies, `HeadObject`, `DeleteObject`, `CopyObject`, `PutObject` + `IfNoneMatch`, multipart Create/UploadPart/Complete/Abort with S3's minimum part size, `failNext()` | no production change; M1 storage + API tests rerun | 90/90 pass |
-| S2 storage `deleteFile` contract (memory, s3, s3 2-item pages) | `node --test --test-name-pattern="deletes a file and nothing else\|deleting a missing file" test/storage.test.js` → **6 fail**: `TypeError: storage.deleteFile is not a function` | 6/6; `test/storage.test.js` 52/52 |
-| S3 API `DELETE /api/files?key=` | `node --test --test-name-pattern="DELETE /api/files \(M2\)" test/api.test.js` → **10 of 11 fail** with `actual: 404` (no route). The "missing file → 404" case passed by coincidence (an unknown route is also 404) | 11/11 |
-| S4 storage `moveFile` contract (3 drivers) | `node --test --test-name-pattern="moves \(renames\)\|refuses to move" test/storage.test.js` → **6 fail**: `TypeError: storage.moveFile is not a function` | 6/6 |
-| S5 S3 move failure paths | `node --test --test-name-pattern="^move: " test/storage.test.js` → **1 of 3 fail**: copy ok + source delete fails gave the raw SDK error (`actual: undefined, expected: 502`). The other 2 are guards that passed at once: a failed copy never deletes the source (copy-then-delete order), and `CopySource` is URL-encoded per segment | 3/3; `test/storage.test.js` 61/61 |
-| S6 API `POST /api/files/move` | `node --test --test-name-pattern="POST /api/files/move \(M2\)" test/api.test.js` → **13 fail** (`actual: 404`, no route) | 13/13 |
-| S7 storage `getDownload` (memory bytes; S3 presigned URL, exactly 300 s) | `node --test --test-name-pattern="^download: " test/storage.test.js` → **6 fail**: `getDownload is not a function` | 6/6; `test/storage.test.js` 67/67. Signing uses `TEST_SIGNER`, a real `S3Client` with dummy credentials whose request handler throws, so no request can leave the process |
-| S7b `attachmentDisposition` encoding (UTF-8 `filename*`, ASCII fallback, quotes, CR/LF) | That encoding went beyond S7's ASCII-only test, so `test/disposition.test.js` was proved against a deliberately simplified helper (no encoding) → **1 fail** (`actual: attachment; filename="Été "q" …`). Then the real helper was restored | 1/1 |
-| S8 API `GET /api/files/download` | `node --test --test-name-pattern="GET /api/files/download \(M2\)" test/api.test.js` → **4 fail** (`actual: 404`, no route). After the route: **1 fail**, a missing bucket (`NoSuchBucket`, 404) came back as 404 `NOT_FOUND`, because `fileExists` treated every 404 as a missing key | 4/4 after `fileExists` counts only `NotFound`/`NoSuchKey` as missing. 302 + `Cache-Control: no-store` (S3); 200 attachment bytes (memory) |
-| S9 storage `putFile` contract (3 drivers): stream of unknown size, `{ size }`, 0-byte file, never overwrites (`FILE_EXISTS`), a failing stream stores nothing | `node --test --test-name-pattern="^upload: " test/storage.test.js` → **9 fail**: `storage.putFile is not a function` | 9/9; `test/storage.test.js` 76/76. Minimal S3 version: buffered single conditional `PutObject` |
-| S10 S3 multipart streaming (`partSize` lowered to 64 in tests; the fake enforces the same minimum) | `node --test --test-name-pattern="^upload: (a stream larger\|parts are sent\|a stream that fits)" test/storage.test.js` → **2 of 3 fail**: a 230-byte stream used `PutObject` (`actual: 1, expected: 0`); "the first part must be uploaded before the stream ends" timed out (whole stream buffered). The single-part case is a guard and passed | 3/3: Create → UploadPart (64, 64, 64, 38) while the stream is still arriving → Complete with `IfNoneMatch: '*'`; at most one part buffered |
-| S11 abort-on-failure cleanup | `abortUpload` went in with S10 without its own failing test, so its tests were proved by mutation. With the abort call removed, `--test-name-pattern="^upload( cleanup)?: (a stream error\|a failed\|losing the race\|if the abort\|a small upload)"` → **5 of 6 fail**. With the `PreconditionFailed` → `FILE_EXISTS` mapping (from S9) removed, `--test-name-pattern="412"` → **2 of 2 fail**. Both files were restored from backups | 6/6; `test/storage.test.js` 85/85. Covers: stream error after parts, UploadPart failure, Complete failure, 412 race on Complete (the other writer's file is kept), the abort itself failing (original error reported, failure logged), 412 on a small `PutObject` |
-| S12a API `POST /api/files?prefix=` (busboy), multi-file, download round trip | `node --test --test-name-pattern="M2 upload" test/api.test.js` → **1 fail** (`actual: 404, expected: 201`, no route) | 1/1: two files in one request, including binary bytes and a UTF-8 name, downloaded byte for byte |
-| S12b per-file size limit (`createApp({ maxUploadBytes })`) | `--test-name-pattern="size limit"` → **3 of 4 fail** (`actual: 201, expected: 413`, no limit); "exactly at the limit" passed only because no limit existed | 6/6 after three problems found while making it pass: (1) busboy emits `'limit'` when a file *reaches* `fileSize`, so it is given `max + 1` (otherwise exactly-at-limit was a 413). (2) **Crash:** the limit could trip while the S3 driver was still awaiting `HeadObject`, and the destroyed `PassThrough` had no `'error'` listener, an unhandled `'error'`. Regression proved by mutation: with the listener removed, "during its existence check" hung and was cancelled at the 10 s test timeout (the watchdog killed the run); restored → passes in 14 ms. (3) My first S3 abort-through-API test used 2,000 bytes, which fits in the stream buffers, so S3 never started a multipart upload. It was strengthened to a 200,000-byte file against a 100,000-byte limit, which asserts parts were streamed, then exactly one abort, no open upload, no object. Hung runs were stopped with `pkill`; afterwards there were no `node --test` processes. All unit + API files: 197/197 |
-| S12c per-file name validation, collisions, request-level 400s | `"$TMPDIR/fm-debug/run.sh" 40 --test-timeout=10000 --test-name-pattern="per file:\|request level:" test/api.test.js` → **3 fail + 2 cancelled**: JSON body and no-boundary gave `500` (busboy's constructor throws); no files gave `201`; the invalid-names test **hung**. Per-file `FILE_EXISTS` and both bad-prefix cases passed (guards) | Request-level 400s fixed: 6/6 non-hanging. **The quota checkpoint stopped here with the invalid-names test still hanging** |
-| Checkpoint resolution: systematic debugging of the hang | One probe request per filename, each with a 2 s deadline, outside the runner (`$TMPDIR/fm-debug/names.mjs`). `..`, `.`, spaces, `/`, the long name and the empty name all returned the right per-file results. The raw `\u0001` crashed the probe with **`Unhandled 'error' event … Error: Malformed part header`** from busboy's parser. **Root cause:** a raw control character is illegal in a part header, so it is malformed framing, not a file name. `receiveUploads` had no parser `'error'` handler, so the request never settled. busboy's `_destroy` also destroys the open file stream with the error, and `pipe()` doesn't forward it | The test premise was corrected: control characters reach name validation legitimately via RFC 5987 `filename*=UTF-8''a%01b.txt`. `--test-timeout=3000 --test-name-pattern="per file: invalid names"` → 1/1 in 16 ms (validation already implemented; this confirms the premise, not new behaviour) |
-| S12d malformed / truncated multipart | Tight command: `"$TMPDIR/fm-debug/run.sh" 30 --test-timeout=3000 --test-name-pattern="malformed or truncated multipart" test/api.test.js` → **5 of 5 cancelled** (each hung until the 3 s timeout; the 30 s watchdog killed the run) | 5/5 in 38 ms. Parser `'error'` → `MALFORMED_UPLOAD` (400, fixed message, detail logged server-side); the rest of the request is drained; the in-flight file fails (the file stream got its own `'error'` handler); files stored before the cut are reported; a malformed request is never 201. S3: a cut mid-multipart aborts the upload (no open upload, no object). All unit + API files: 214/214 |
-| S12e client disconnects mid-upload | `run.sh 30 --test-timeout=6000 --test-name-pattern="client abort" test/api.test.js` → **1 of 2 fail**: S3 "multipart upload aborted after the client left" never happened (`actual: false`), because `pipe()` never ends the parser. The memory case passed (guard), but only because the partial stream never ended, which leaks a pending write | 2/2: `req` `'close'` without `req.complete` destroys the parser, which reuses the 12d path; the S3 upload is aborted, nothing stored, the server keeps serving. Unit + API 216/216 |
-| S12f per-file S3 failure → fixed reason | `--test-name-pattern="per file: an S3 failure"` passed at once (12b sends per-file errors through `toPublicError`), so it was proved by mutation: per-file errors built from the raw `error.name`/`message` → **1 fail** (`error: { code: 'AccessDenied', message: 'secret internal detail' }`). File restored from backup | 1/1: 502 `UPLOAD_INCOMPLETE`; the file gets `STORAGE_ERROR`/`ACCESS_DENIED`; the raw message is only in the server log; no open upload |
-| S12g `MAX_UPLOAD_MB` reaches the real app | `run.sh 30 --test-timeout=15000 --test-name-pattern="MAX_UPLOAD_MB reaches" test/start.test.js` (spawns the real `src/demo.js` with `MAX_UPLOAD_MB=0.001`) → **1 fail**: a 2,000-byte file got `201` (both entry points called `createApp({ storage })`, so the limit was never wired) | 1/1: `start(storage, config, label)` now builds the app with `maxUploadBytes = floor(MAX_UPLOAD_MB × 1 MiB)`. `server.js` and `demo.js` both call it, so the path is shared (the M1 startup tests still drive both entry points). `test/start.test.js` + `test/config.test.js`: 10/10 |
-| U1 file-row Download/Rename/Delete, touch targets, no HTML injection | `run.sh 90 --test-timeout=20000 --test-name-pattern="M2: file-row actions" test/browser.test.js` → **3 fail**: rows had no actions (`buttons: []`; 0 of 6 targets) | 3/3. While going GREEN, the in-browser download returned 500: the browser test's storage proxy forwarded only the M1 methods (test harness, not a product bug). It now forwards `getDownload`/`deleteFile`/`moveFile`/`putFile`, with `mutationDelay` on the mutations. Rows: `a.button.download` → `/api/files/download?key=…`, plus Rename and Delete buttons, all ≥ 44×44 at 375 px and 1280 px, no horizontal scroll at 375 px; a `<img onerror>` file name renders as text |
-| U2 UI file delete | `--test-name-pattern="^delete: "` → **4 fail** (no confirm; nothing deleted). An M1 N3 test also matches the pattern and passed | 5/5: explicit `confirm('Delete file "x"?')`; declining sends nothing; errors shown; completion after navigation leaves the new folder's status alone (D16) |
-| U3 UI rename/move | `--test-name-pattern="^rename: "` → **5 fail** (no prompt) | 5/5: `prompt` pre-filled with the full key (checked through CDP's `defaultPrompt`); cancel or no change sends nothing; rename in place or move to `docs/sub/`; 409 shown; S3 `MOVE_INCOMPLETE` shown as an error; D16 |
-| U4 UI uploads: multi-file picker, per-file progress/result, partial failure, D16, touch target | `run.sh 120 --test-timeout=20000 --test-name-pattern="M2: uploads" test/browser.test.js` → **6 fail** (no `#upload-input`, no `label.upload`) | 6/6 after one CSS fix (the label measured 85×22 px because the button rule targeted only `a.button`). Real files go through CDP `DOM.setFileInputFiles` from a `mkdtemp` dir, removed in `after()`. One XHR per file (fetch has no upload progress); an intermediate progress value is observed on an 8 MiB file; a partial failure gives `Uploaded 1 of 2 files; 1 failed (see the list below).` as an error, with the per-file reason, and nothing overwritten; an upload finishing after navigation leaves the new folder's status alone while the list keeps its result. Browser + helper suites: 57/57, 0 skipped |
-| X1 cross-site write protection (found during the M2 security review) | A multipart POST is a CORS "simple request" (no preflight), so any web page could upload into the bucket through the user's browser; the Host guard allows `127.0.0.1:3000`. `run.sh 30 --test-timeout=5000 --test-name-pattern="cross-site requests" test/api.test.js` → **3 of 4 fail**: uploads with `Origin: http://evil.example`, `null` and `http://127.0.0.1:1` all got `201`. The same-origin/no-Origin case passed (guard) | 4/4: `sameOriginWrites` refuses API writes (anything but GET/HEAD) whose `Origin` is present and isn't this host → 403 `FORBIDDEN_ORIGIN`. The UI (same-origin) and the agent (no `Origin`) are unaffected. M1's DELETE and JSON POSTs were already protected by CORS preflight; this covers them too. Non-browser files: 226/226 |
+| P1 `previewKind(key)` + `PREVIEW_TEXT_BYTES` (`src/preview.js`, new) | `node --test test/preview.test.js` → **1 fail**: `ERR_MODULE_NOT_FOUND … src/preview.js` | 6/6 |
+| (test infra) fake S3 `GetObject` with `Range` (clamped end; 416 `InvalidRange` on an empty object; `NoSuchKey`; `Body.transformToByteArray()`) | no production change | — (exercised from P2 on) |
+| P2 storage contract `getPreview` for text (memory, s3, s3 2-item pages): small/empty file, HTML returned raw, exactly 1 MiB vs 1 MiB + 1 byte, a multi-byte character split by the limit, missing key / folder name → `NOT_FOUND` for every kind | `node --test --test-name-pattern="^preview" test/storage.test.js` → **15 of 15 fail**: `TypeError: make(...).getPreview is not a function` / `storage.getPreview is not a function` | 15/15; `test/storage.test.js` + `test/preview.test.js` 115/115. Shared `textPreview()` (streaming `TextDecoder` drops a character cut by the limit). S3: `HeadObject` (existence + size), then one ranged `GetObject` `bytes=0-1048575` (none for an empty object). Non-text kinds temporarily `{ kind: 'none' }` (P3) |
+| P3 storage contract `getPreview` for image/PDF/none (3 drivers): memory → `{ kind, contentType, body }`; S3 → `{ kind, contentType, url }`, presigned for exactly 300 s with `response-content-type` from the extension and `response-content-disposition: inline` | `node --test --test-name-pattern="^preview" test/storage.test.js` → **3 of 21 fail** (the image/PDF test, once per driver): memory `actual: { kind: 'none' }`; S3 `actual: ['kind'], expected: ['contentType', 'kind', 'url']`. The "other types are none" test passed (guard; the P2 placeholder already answered `none`) | 21/21; storage + preview + disposition 123/123. `inlineDisposition()` was added to `src/disposition.js` (shared with `attachmentDisposition`); its unit test in `test/disposition.test.js` was written together with it, not seen failing on its own; its behaviour was first seen failing through this slice's S3 assertion `^inline; filename="` |
+| P4 S3 preview specifics: request cost (HEAD + one GET `Range: bytes=0-1048575`; no GET for an empty file or an image), a file deleted between HEAD and GET, SDK errors (incl. `NoSuchBucket` on HEAD) passed through | `node --test --test-name-pattern="^preview: (a text file costs\|a file deleted\|S3 failures)" test/storage.test.js` → **1 of 3 fail**: the HEAD→GET race gave the raw `NoSuchKey: simulated NoSuchKey` instead of `{ status: 404, code: 'NOT_FOUND' }`. The other 2 are guards that passed at once | 3/3; storage + preview + disposition 126/126. `GetObject` `NoSuchKey` → `NOT_FOUND` |
+| P5 API `GET /api/files/preview?key=` (each kind, 1 MiB boundary, HTML as JSON text, memory same-origin URL, S3 presigned URL, `none`, 404/400 incl. `%01`/repeated/structured keys, S3 failures → fixed reasons, `Cache-Control: no-store`) | `node --test --test-name-pattern="GET /api/files/preview \(M3\)" test/api.test.js` → **7 of 7 fail** (`actual: 404`, `Unknown API endpoint`: no route) | 7/7. Response is exactly `{ kind, text, truncated }`, `{ kind, url }` or `{ kind }` (the storage's `contentType`/`body` never reach the JSON) |
+| Experiment (scratch, `$TMPDIR/fm-m3/pdf-csp.mjs`, localhost only): a PDF in a same-origin iframe under 4 response CSPs, headless Chrome 155 | The page's global CSP (`frame-ancestors 'none'`) → the frame is `chrome-error://chromewebdata/` (blocked). `frame-ancestors 'self'`, `default-src 'none'; frame-ancestors 'self'` and even `… sandbox` → Chrome's PDF viewer loads (target `chrome-extension://mhjfbmdgcfjbbpaeojofohoefgiehjai/index.html`) | Chosen for the content route: `default-src 'none'; frame-ancestors 'self'` (no `sandbox`: not needed with a fixed type + `nosniff`, and other browsers' PDF viewers may refuse sandboxed frames) |
+| P6 API `GET /api/files/preview/content?key=` (memory/demo's preview URL): bytes inline with the extension's type (even if the bytes are HTML), `nosniff`, `no-store`, own CSP; S3 → 302 to the presigned URL; text/none → 400; missing → 404; bad keys → 400 | `node --test --test-name-pattern="preview/content" test/api.test.js` → **3 of 3 fail** (`actual: 404`, no route) | 3/3. The kind is checked from the key before storage is called |
+| P7 page CSP allows S3 presigned previews: `img-src`/`frame-src 'self' https://*.amazonaws.com`; `default-src`, `object-src`, `frame-ancestors` unchanged; no `script-src` widening | `node --test --test-name-pattern="M3: the page CSP" test/api.test.js` → **1 fail**: `img-src` `actual: undefined` | 1/1. All non-browser files (`api`, `storage`, `preview`, `disposition`, `paths`, `config`, `start`): 290/290 |
+| U1 UI: a Preview button on every file row; a `<dialog>` with the file name, the exact text in a `<pre>` (`textContent`), a Download link; Close; HTML content and a hostile file name never become markup or run script. The two M2 row tests now expect the Preview button (labels; 8 targets ≥ 44×44 instead of 6) | `node --test --test-timeout=30000 --test-name-pattern="M3: preview\|M2: file-row actions" test/browser.test.js` → **5 of 15 fail**: the 2 M3 tests (no Preview button; one also hit a **test bug**: a hostile name's `"` broke the CSS attribute selector, so the helper now matches the label by equality; rerun → both fail with `Cannot read properties of undefined (reading 'click')`), plus the 3 updated M2 expectations (`actual: 6`; no Preview label) | 15/15 |
+| U2 UI truncation notice: over 1 MiB → the first 1 MiB, a visible on-screen notice, Download still offered; exactly 1 MiB → no notice | `node --test --test-timeout=30000 --test-name-pattern="text over 1 MiB" test/browser.test.js` → **1 fail**: notice `actual: ''` | `M3: preview` 3/3 |
+| U3 UI image / PDF / none: a real 1×1 PNG loads in an `<img>` (`naturalWidth` 1, alt = name) from the preview URL; an undecodable `.jpg` → error in the dialog, Download kept, folder status untouched; a real PDF (`test/helpers/fixtures.js`) in an `<iframe>` that Chrome's PDF viewer renders (its extension target appears; absent before), plus an "Open the PDF in a new tab" link (`noopener noreferrer`); `.zip` → a message, an empty body, Download | `node --test --test-timeout=30000 --test-name-pattern="^(image\|PDF\|other types)" test/browser.test.js` → **4 of 4 fail**: `img`/`frame` `actual: null`; the bad-image message never appeared (timed out); the `none` message `actual: ''` | `M3: preview` 7/7 |
+| U4 UI errors: a file deleted after the listing loaded → "This file no longer exists." and a simulated S3 outage → the fixed "S3 is temporarily unavailable.", both as errors in the dialog (state `error`), Download kept, folder status untouched, no uncaught page error | `node --test --test-timeout=30000 --test-name-pattern="^errors: a file removed" test/browser.test.js` → **1 fail**: `Timed out waiting for: preview settled` (the rejected request left the dialog loading, an unhandled rejection) | 7 of 8, then 8/8: the U3 bad-image test then failed once (`actual: ''`). **Test race, not a regression:** it waited for "message not empty", which `Loading preview…` already satisfies; it now waits for the error class. 8/8 in 3 consecutive runs |
+| U5 UI stale previews (500 ms server delay per key): navigating while loading, the back button while loading, Close while loading, Escape while loading, A (slow) then B, and a late image-decode error from a closed preview | `node --test --test-timeout=30000 --test-name-pattern="stale preview responses" test/browser.test.js` → **6 of 6 fail**: the dialog stayed open after navigation (`actual: true`) and after back (`{ open: true, children: 1 }`); late responses filled the closed dialog (`children: 1`, after Close and after Escape); A's late text was added next to B's (`actual: 2` `<pre>`s); the old image's error marked the next preview (`'This image could not be displayed…', true`) | 6/6; `M3: preview` 14/14. `previewSeq` + `AbortController` like `load()`; `endPreview()` on open/Close/Escape (`close` event, ignored if a newer preview reopened the dialog)/`hashchange`; the image `error` handler checks `isCurrent()` |
+| U6 UI phone (375 px) and desktop (1280 px): dialog and long title inside the viewport; a 4,000-character line wraps; a 3000×20 PNG (`solidPng`, `test/helpers/fixtures.js`) and the PDF frame scale to fit; no horizontal page scrolling; Close/Download/"Open the PDF" ≥ 44×44 | `node --test --test-timeout=30000 --test-name-pattern="^usable on a" test/browser.test.js` → **2 of 2 fail**: `long lines wrap` `actual: true` (the `<pre>` overflowed) | 2/2; `M3: preview` 16/16. `public/style.css`: dialog full screen ≤ 560 px, `pre-wrap` + `overflow-wrap: anywhere`, `img { max-width: 100% }`, PDF frame `70dvh` |
+| U7 S3 driver (fake client + `TEST_SIGNER`) in the browser: the image and PDF previews use the presigned `https://test-bucket.s3.us-east-1.amazonaws.com/…` URLs and the page CSP lets them load. **No network:** Chrome now starts with `--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE 127.0.0.1` (`test/helpers/chrome.js`, every browser test), and the test intercepts every request with CDP `Fetch` (127.0.0.1 continues; the bucket host is answered from the fake bucket; anything else fails) | Guard: `node --test --test-timeout=30000 --test-name-pattern="^S3: image and PDF previews" test/browser.test.js` passed at once (P7 + U3 already implement it). **Proved by mutation** (backup in `$TMPDIR/fm-m3`, restored, then deleted): `S3_PREVIEW_SOURCE = ''` → **1 fail** `the S3 image loaded (CSP allowed it)` `actual: 0`; only `frame-src` without the S3 source → **1 fail** (the frame never requested its presigned URL; timed out) | 1/1 after each restore |
+| Full browser + helper suites after U7 (does the resolver flag break anything?) | — | `node --test test/browser.test.js test/chrome-helper.test.js` → 84/84, 0 skipped |
+| REFACTOR: the S3 driver's download and preview URLs share `presignGet(key, overrides)`; `DOWNLOAD_URL_SECONDS` → `PRESIGNED_URL_SECONDS` | behaviour unchanged | all non-browser files 290/290 |
+| Demo data (`src/demo.js`): a real 96×64 PNG (`Photos/gradient.png`), a one-page PDF with text (`Documents/sample.pdf`), an HTML file with a `<script>` (`Documents/page.html`); the existing fake `beach.jpg` shows the "could not be displayed" path. Bytes generated once by scratch scripts in `$TMPDIR/fm-m3` and stored as base64 | `test/start.test.js` still drives `src/demo.js` | in the full run |
+| Live smoke + screenshots (scratch `$TMPDIR/fm-m3/smoke.mjs`): real `src/demo.js` on a free 127.0.0.1 port; headless Chrome with the test helper (no host resolution) | — | `page.html` → `{ kind: 'text', text: '<h1>…<script>…', truncated: false }`; `gradient.png`/`sample.pdf` → same-origin `url`; `.csv` → text; `nope.txt` 404; `../x` 400; content route → `image/png` / `application/pdf` with CSP `default-src 'none'; frame-ancestors 'self'`, `no-store`; `page.html` on the content route → 400. Screenshots (375 px and 1280 px) checked by eye: HTML shown as literal text; the PDF rendered ("Demo PDF") with the open-in-tab link; the image fits; the bad JPEG shows the error with Download. One cosmetic fix from them: the phone dialog bar wrapped Close onto its own line, so the title's flex basis went 12rem → 8rem (the U6 layout tests still pass). No page errors; demo stopped (SIGTERM) |
 
-`run.sh` above is a scratch watchdog wrapper outside the repo (`$TMPDIR/fm-debug/run.sh`, since removed). It ran
-`node --test <args>`, killed the run if it passed the given number of seconds, and printed the summary.
-macOS has no `timeout` binary, and `--test-timeout` alone can't end a run while a request is stuck open.
-The other mutation checks used `cp` backups in `$TMPDIR` that were restored and deleted.
-
-## Review follow-ups (after the M2 review PASS, `docs/CLAUDE_REVIEW.md`; approved by Eve)
-The same `run.sh` watchdog was recreated for this session (`$TMPDIR/fm-debug/run.sh`) and removed at the end.
-
-| Follow-up | RED command and result | GREEN result |
-|---|---|---|
-| F1 file/folder name collisions (storage contract for 3 drivers, API, UI) | `run.sh 60 --test-timeout=10000 --test-name-pattern="collision" test/storage.test.js test/api.test.js` → **8 of 11 fail** (uploads/moves onto `empty`, `implicit`, `a/sub`, `ab`, and through `readme.txt/…`, all succeeded). The 3 passes are the guard "similar names (`abc` vs `ab/`, `a.txt` vs `a/`) are not conflicts, and an existing file is still `FILE_EXISTS`", once per driver. `run.sh 90 --test-timeout=20000 --test-name-pattern="onto a folder's name\|name of a folder here" test/browser.test.js` → **2 fail** (the rename and the upload went through) | 11/11 and 2/2. 409 `NAME_CONFLICT`, with exactly two fixed messages: `A folder with that name already exists` (the key is a folder's name; marker or implicit) and `Part of that path is a file, not a folder` (an ancestor of the key is a file). It is checked after `FILE_EXISTS`, which keeps precedence, for `putFile` (before reading the stream; memory re-checks before storing) and `moveFile`. One existing test (`… during its existence check) is a 413, not a crash`) asserted the exact S3 call list `['HeadObjectCommand']`; the new read-only `ListObjectsV2` collision check made it fail. It now asserts its intent, "no write or upload command, no object", which keeps the guarantee. Non-browser files: 237/237 |
-| F2 total upload request limit (decision **D22**: body ≤ `MAX_UPLOAD_MB` + 64 KiB multipart framing) | `run.sh 60 --test-timeout=8000 --test-name-pattern="request limit" test/api.test.js` → **5 of 7 fail**: a declared body one byte over the limit and 70 × 1,000-byte files (each within the per-file limit) both got `201`; a chunked 70-file body got `201`; a flood after an over-limit file was read in full (it ended as a 400 truncated form); a malformed flood stayed `connection: keep-alive` (the old malformed path called `req.resume()`, an unbounded drain). The 2 passes are guards (malformed under the limit stays `MALFORMED_UPLOAD`; client disconnect keeps only complete files, no open S3 upload) | 9/9, then 11/11 with 2 more guards. `src/upload.js`: a declared `Content-Length` over the limit → 413 `REQUEST_TOO_LARGE` before anything is read or stored; a chunked body is counted as it streams and stops the parser at the limit (the in-flight file fails with the same error and its S3 multipart upload is aborted; files before it are reported and stored; `details.requestTooLarge`); on any stop the counter is removed, `req` is unpiped and paused, and the route answers `Connection: close`, so the rest is never read. **Two test premises were corrected** while going GREEN: (1) a client writing 3.2 MB can't read an early answer (Node's client gets `EPIPE` and drops the response; seen in a probe), so the flood test asserts "cut off: connection closed early, nothing stored, server healthy"; a separate test shows a client still sending a little after the stop *does* get its 413/400 with `Connection: close`. (2) The "a little after" over-limit case must first pass 66,560 bytes, or only the per-file limit applies. **No lingering-close code was added:** the guard "a body up to 2× the limit still reads its 413" passed in 3 of 3 runs (declared and chunked) without it. One existing test (S3 abort when the per-file limit trips mid-upload) sent 200,000 bytes, which is now over the request limit; it now sends 150,000 (over the 100,000 file limit, under the 165,536 request limit), keeping its coverage. Non-browser files: 248/248 |
-| F3 overlapping uploads keep every row and result | `run.sh 120 --test-timeout=20000 --test-name-pattern="overlapping uploads" test/browser.test.js` → **3 of 3 fail**: once batch B started, the list held only B (`actual: ['three.txt']`); A's partial failure, and every A row in the D16 case, were gone | `public/app.js` appends each batch's rows instead of `replaceChildren`; the list lasts until the page is reloaded. One expectation was corrected: a rejected file's progress bar shows 100, because it measures bytes *sent* (the browser sent the whole file before the server refused). All `M2: uploads` tests: 10/10 |
-| F4 no upload into a folder that failed to load | `run.sh 150 --test-timeout=20000 --test-name-pattern="upload needs a loaded folder" test/browser.test.js` → **5 of 5 fail**: upload was never disabled (`{ disabled: false, labelDisabled: null }`) after a 404, after a 502, during loading, or after stale loads in either order | 5/5. `load()` disables upload when it starts and enables it only when the *current* load succeeds (stale results return before touching it), with `input.disabled`, `aria-disabled` and a `.disabled` style on the label. `uploadFiles` also refuses while disabled. Mutation check: with that handler guard removed, the forced `change` test failed because `one.txt` was uploaded into `missing/`, creating it; restored → passes. Browser + helper suites: 67/67, 0 skipped |
-
-## M2 acceptance criteria → evidence
-| Criterion (`IMPLEMENTATION_BRIEF.md` §5 M2) | Where |
+## M3 acceptance criteria → evidence
+| Criterion (`IMPLEMENTATION_BRIEF.md` §5 M3, §4 API, and the M3 instruction) | Where |
 |---|---|
-| Upload (multi-file, progress), download, rename/move, delete | API: S3, S6, S8, S12a; UI: U1–U4 |
-| Tests: upload/download round trip, oversize → 413, rename, delete, bad keys → 400 | S12a (byte-for-byte round trip), S12b, S6/U3, S3/U2, S1/S3/S6/S8/S12c |
-| Uploads streamed, bounded by `MAX_UPLOAD_MB` (default 100); partial multi-file failures reported per file, never claiming failed files succeeded | S10 (parts sent while the stream arrives, at most one part buffered), S12b/S12g (limit, wired from the env), S12b–S12f, U4 |
-| Download: short-lived presigned 302 from real S3; deterministic local response for memory/demo | S7 (`X-Amz-Expires=300`), S8 (302 + `no-store`; memory 200 attachment) |
-| Rename/move is copy-then-delete; rejects a missing source and an existing destination; never deletes the source when the copy fails; reports a partial move | S4, S5, S6, U3 |
-| Delete file: explicit browser confirmation and exact server-side key validation | U2 (`confirm`), S1/S3 (`parseFileKey`, no normalisation) |
-| UI: multi-file picker, per-file progress/result, row actions, phone width, stale outcomes don't overwrite a later folder's status, touch targets ≥ 44×44 | U1–U4 (375 px and 1280 px; D16 tests for delete, rename and upload) |
-| Shared memory/S3 contract + fake-S3 tests; browser regression tests; no unapproved dependency | `test/storage.test.js` contract (memory, s3, s3 2-item pages), S3 specifics; `test/browser.test.js`; only the two approved packages were added |
+| Text / image (jpg, jpeg, png, gif, webp) / PDF preview; other types offer download only | P1, P3, P5; U1, U3 (`none` → message + Download) |
+| `GET /api/files/preview?key=` → `{ kind, text?, truncated?, url? }` | P5 (exact JSON shapes per kind) |
+| Text capped at 1 MiB; `truncated: true` and a visible notice when larger | P2 (exactly 1 MiB vs + 1 byte; split UTF-8 character), P4 (S3 fetches only the first 1 MiB), P5, U2 (notice on screen; none at exactly 1 MiB) |
+| HTML and every user-controlled string shown strictly as text | P2/P5 (raw characters), U1 (no element injected, no script run, hostile file name as title), content route types by extension + `nosniff` (P6). `public/app.js` still has no HTML sinks |
+| Image/PDF URLs: 5-minute presigned GET for real S3; memory/demo deterministic, never AWS | P3 (`X-Amz-Expires=300`, `response-content-type`, inline), P5, P6, U7 (S3 URLs load under the CSP, intercepted locally) |
+| Phone and desktop UI, touch targets, download always available | U1 (row buttons, now 8 targets ≥ 44×44 at 375/1280 px), U6, U3/U4 (Download in every state) |
+| Stale-navigation protections preserved; safe DOM APIs | U5 (navigation, back, Close, Escape, A→B, late image error); all existing M1/M2 stale tests pass |
+| Contract + fake-S3/API + browser tests: every kind, truncation boundary, invalid/missing keys, storage failures, HTML/XSS, navigation while loading, phone usability | P2–P7, U1–U7 |
+| M1/M2 behaviour and tests preserved | full run 377/377; the only changed expectations are the two M2 file-row tests (the new Preview button) |
 
-## Key decisions (M2)
+## Key decisions (M3; recorded as D24)
 | Decision | Reason |
 |---|---|
-| Storage interface gains `putFile(key, stream)`, `getDownload(key)`, `moveFile(from, to)`, `deleteFile(key)` (documented in `src/storage/memory.js`) | One contract for both drivers |
-| Uploads and moves never overwrite (409 `FILE_EXISTS`). S3 uses a `HeadObject` pre-check plus conditional writes (`IfNoneMatch: '*'` on `PutObject`/`CompleteMultipartUpload`) | Safe default with no overwrite flag in the brief; the conditional write closes the upload race |
-| S3 upload: at most one 8 MiB part buffered; a body that fits in one part is a single `PutObject` with a known length, otherwise Create/UploadPart/Complete; abort on any failure (an abort failure is logged, and the original error reported) | The approved decision; memory stays bounded; S3's 5 MiB minimum part size |
-| `getDownload`: S3 checks existence first (a JSON 404 instead of an S3 error page), then presigns `GetObject` for 300 s with `Content-Disposition: attachment` (RFC 6266/8187, `src/disposition.js`). Memory returns the bytes | Approved decision; never render bucket content inline |
-| Move partial failure → 502 `MOVE_INCOMPLETE` `{ from, to, copied: true, sourceDeleted: false, reason }` | "Report a partial move"; no data loss, but it must be visible |
-| Upload response: 201 `{ files }` only if every file was stored. Otherwise `UPLOAD_FAILED`/`UPLOAD_INCOMPLETE` with per-file `error`s; the status is the failures' common status, else 502 if any is a 5xx, else 400. A malformed or cut-off body is never 201 and is reported as `details.malformed` | Per-file reporting; never claim failed files succeeded; oversize single file → 413 |
-| busboy: `preservePath: true` (a `/` in a name is rejected, never silently cut), `defParamCharset: 'utf8'`, `fileSize: max + 1`, an empty file input is ignored, non-file fields are ignored | Exact names; busboy's limit fires when the limit is *reached* |
-| `toPublicError()` (`src/errors.js`) is shared by the error handler and the per-file upload errors | Fixed client errors everywhere; raw details only in the server log |
-| `start(storage, config, label)` builds the app for both entry points | `MAX_UPLOAD_MB` was not wired; one shared path |
-| `sameOriginWrites`: API writes with a foreign/`null` `Origin` → 403 `FORBIDDEN_ORIGIN` | Multipart POSTs need no CORS preflight; there is no login (D2/D9). Now recorded as **D21** |
-| F1/D23: 409 `NAME_CONFLICT` (two fixed messages) for upload/move destinations that are a folder's name or go through a file; checked after `FILE_EXISTS` | No same-name file + folder through uploads or moves; existing collision semantics kept. Folder creation unchanged (M1 scope) |
-| F2/D22: request body ≤ `MAX_UPLOAD_MB` + 64 KiB; declared `Content-Length` pre-checked; chunked bodies counted; on stop: unread rest, `Connection: close` | Smallest rule tied to the existing setting (one file of exactly the limit always fits); no new config; bounded reading. No lingering-close drain: the only case where it would matter (a client streaming far beyond the limit) gets a connection reset, documented |
-| F3: the upload list is appended to, never replaced | An earlier upload's rows (and the rows its status points at) must stay visible |
-| F4: upload is enabled only after the *current* folder loaded successfully (`setUploadEnabled` in `load()`; handler guard too) | A failed/missing folder must not be created implicitly; stale loads can't toggle it |
-| UI: one XHR per file (fetch has no upload progress); the upload list keeps every file's result after navigation, while the status line follows D16; rename is a `prompt` pre-filled with the full key (rename or move) | Brief's UI requirements; D16 unchanged |
-| `IMPLEMENTATION_BRIEF.md`: D20 (dependency approvals), D21–D23, the stack line. `README.md`: status, M2 API, IAM `s3:AbortMultipartUpload`, a lifecycle-rule tip, `FORBIDDEN_ORIGIN`, `NAME_CONFLICT`, the request limit. `CLAUDE.md`: architecture and stale-response rules | Durable record; M2 scope unchanged |
+| Kind by extension only (`src/preview.js`), case-insensitive; `.svg` is text | No content sniffing; SVG can carry script, so it's never shown as an image |
+| Storage gains `getPreview(key)` (documented in `src/storage/memory.js`): text `{ kind, text, truncated }`; image/PDF `{ kind, contentType, url }` (S3) or `{ kind, contentType, body }` (memory); `{ kind: 'none' }`; `NOT_FOUND` for any kind | One contract for both drivers; the API never forwards `contentType`/`body` |
+| S3 text: `HeadObject` (existence + size; `NoSuchBucket` stays a storage error) + one `GetObject` `Range: bytes=0-1048575`; none for an empty object; `NoSuchKey` on the GET → `NOT_FOUND` | At most 1 MiB read; S3 refuses a range on an empty object |
+| UTF-8 with U+FFFD for invalid bytes; when truncated, a character cut by the limit is dropped | No broken last character |
+| S3 image/PDF: presigned 300 s with `ResponseContentType` from the extension and `ResponseContentDisposition: inline` | The stored type is never trusted (uploads store none; the M2 review's note 4) |
+| Memory/demo: `GET /api/files/preview/content?key=` (bytes, extension type, `nosniff`, own CSP `default-src 'none'; frame-ancestors 'self'`); on S3 it 302s to the presigned URL; 400 for text/none | A deterministic URL without AWS; the global CSP's `frame-ancestors 'none'` would block the PDF frame (experiment row) |
+| Page CSP: `img-src`/`frame-src 'self' https://*.amazonaws.com` | Presigned S3 previews must load; scripts remain same-origin |
+| UI: `<dialog>` (modal; full screen ≤ 560 px) with title, Download, Close; text in `<pre>` via `textContent`; image `<img alt=name>`; PDF `<iframe>` + "Open the PDF in a new tab"; errors in the dialog only (never the folder status) | Phone + desktop; iOS may show only page 1 of a framed PDF |
+| Stale previews: `previewSeq` + `AbortController` (like `load()`); closed on Close, Escape and every `hashchange` (incl. Back) | Only the preview on screen may render; D16's spirit |
+| Test Chrome: `--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE 127.0.0.1` | Hard guarantee that browser tests can't reach AWS/the internet |
 
-## Changed files (uncommitted; HEAD `1fa3d1b`; nothing staged)
-- **New (untracked):** `src/upload.js` (busboy receiver), `src/disposition.js` (attachment header),
-  `test/disposition.test.js`
-- **Modified source:** `src/app.js` (routes, `sendUploadResults`, `sameOriginWrites`, `toPublicError` use, request limit),
-  `src/errors.js` (`toPublicError`, `moveIncomplete`, `NAME_CONFLICT` factories), `src/paths.js` (`parseFileKey`,
-  `ancestorPaths`), `src/storage/memory.js`,
-  `src/storage/s3.js`, `src/start.js`, `src/server.js`, `src/demo.js`, `public/app.js`, `public/index.html`,
-  `public/style.css`
-- **Modified tests:** `test/api.test.js`, `test/storage.test.js`, `test/paths.test.js`, `test/start.test.js`,
-  `test/browser.test.js`, `test/helpers/fake-s3-client.js` (M2 commands, failure injection, `TEST_SIGNER`)
-- **Modified docs/config:** `docs/HANDOFF.md`, `README.md`, `IMPLEMENTATION_BRIEF.md` (D20–D23 + stack line),
-  `CLAUDE.md` (architecture + stale-response rules; authorised by Mr. So), `package.json` and `package-lock.json`
-  (the two approved dependencies)
-- **Review artifact, preserved as written by the reviewer:** `docs/CLAUDE_REVIEW.md` (not edited by this session)
-- **Unchanged:** `.env.example`, `.gitignore`, chrome helper and its tests
+## M3 implementation scope (relative to the M2 commit `d4d6b50`)
+- **New:** `src/preview.js`, `test/preview.test.js`, `test/helpers/fixtures.js`
+- **Modified source:** `src/app.js` (two routes, CSP), `src/storage/memory.js`, `src/storage/s3.js`, `src/disposition.js`
+  (`inlineDisposition`), `src/demo.js` (sample files), `public/app.js`, `public/index.html`, `public/style.css`
+- **Modified tests:** `test/storage.test.js`, `test/api.test.js`, `test/browser.test.js`, `test/disposition.test.js`,
+  `test/helpers/fake-s3-client.js` (`GetObject` + `Range`), `test/helpers/chrome.js` (resolver rule)
+- **Modified docs:** `docs/HANDOFF.md`, `README.md`, `IMPLEMENTATION_BRIEF.md` (D24, architecture line, API row)
+- **Unchanged:** `CLAUDE.md`, `package.json`, `package-lock.json`, `.env.example`, `.gitignore`, `docs/CLAUDE_REVIEW.md`,
+  `test/chrome-helper.test.js`, `src/config.js`, `src/server.js`, `src/start.js`, `src/upload.js`, `src/errors.js`, `src/paths.js`
 
-## Verification (2026-10-09, Node v26.8.1, npm 11.19.0, Google Chrome 155.0.8059.39)
-All rerun after the review follow-ups.
-
+## Verification (2026-10-09, Node v26.8.1, Google Chrome 155)
 | Command | Result |
 |---|---|
-| `npm test` | exit 0: **317 tests, 317 pass, 0 fail, 0 cancelled, 0 skipped**, 44 suites, about 35 s (285 at the M2 review; M1 baseline 154) |
-| `node --test test/browser.test.js test/chrome-helper.test.js` | 67/67, 0 skipped |
-| Non-browser files (`api`, `storage`, `paths`, `disposition`, `config`, `start`) | 248/248 (after F2); also included in the full run above |
-| `node --check` on all 22 `.js` files in `src/`, `src/storage/`, `public/`, `test/`, `test/helpers/` | no failures |
-| `npm ls --depth=0` | exit 0: `@aws-sdk/client-s3@3.1147.0`, `@aws-sdk/s3-request-presigner@3.1147.0`, `busboy@1.6.0`, `express@5.2.1` |
-| `npm ls --all` | exit 0 |
-| package/lock | `package.json` dependency ranges == lockfile `packages[""]`; lock == installed for all four; lockfileVersion 3. vs HEAD, the lock added exactly `@aws-sdk/s3-request-presigner`, `busboy`, `streamsearch` and removed nothing |
-| `git diff --check` / untracked files | clean / no trailing whitespace |
-| Secret scan (tracked + untracked: `AKIA…`, `aws_secret_access_key`, `secretAccessKey`, `-----BEGIN`) | only the dummy `TEST_SIGNER` credential in `test/helpers/fake-s3-client.js` and docs describing the scan. `.env` is absent |
+| `npm test` | exit 0: **377 tests, 377 pass, 0 fail, 0 cancelled, 0 skipped**, 50 suites, about 42 s. Of these, 374 are real tests and 3 are the files in `test/helpers/` that Node's default glob also loads as (empty, passing) test files; the 317 baseline likewise counted 2 |
+| Per file | api 121, storage 118, browser 75, paths 33, chrome-helper 9, preview 6, config 5, start 5, disposition 2 (all pass, 0 skipped) |
+| `node --check` on every tracked + untracked `.js`/`.mjs` outside `node_modules` | 25 files, 0 failures |
+| `npm ls --depth=0` / `npm ls --all` | exit 0 / exit 0: `@aws-sdk/client-s3@3.1147.0`, `@aws-sdk/s3-request-presigner@3.1147.0`, `busboy@1.6.0`, `express@5.2.1` |
+| `git diff --check`; trailing whitespace in untracked files | clean; none |
+| Secret scan (`AKIA…`, `ASIA…`, `aws_secret_access_key`, `secretAccessKey`, `-----BEGIN`) | only the existing dummy `TEST_SIGNER` credential and docs describing scans. `.env` absent, not read |
 | Frontend HTML sinks (`innerHTML`, `outerHTML`, `insertAdjacentHTML`, `eval(`, `document.write`) | only the comment saying none are used |
-| Live smoke (follow-ups): real `src/demo.js`, free port, `MAX_UPLOAD_MB=0.001` (request limit 66,584 B), no AWS | upload `ok.txt` 201; a file named `Documents` → 409 `NAME_CONFLICT` "A folder with that name already exists"; move to `readme.txt/inside.txt` → 409 "Part of that path is a file, not a folder"; move onto `Photos` → 409; 70 × 1,000 B declared (76,170 B) → 413 `REQUEST_TOO_LARGE`; the same chunked → 413 `UPLOAD_INCOMPLETE`, `connection: close`, 60 stored, and the listing matches the reported files exactly; cross-site upload → 403; `/app.js` serves `setUploadEnabled` and the appending list; demo stopped |
-| Live smoke (M2, earlier session) | upload/list/download/move/delete/cross-site all as specified. Its "Host guard" line was **not** evidence (`fetch` drops a custom `Host`); the guard is covered by `test/api.test.js` |
-| Processes / temp | no `node --test`, demo, server or Chrome processes; no `file-manager-chrome-*` or `file-manager-upload-test-*` dirs in `$TMPDIR`; scratch `$TMPDIR/fm-debug` removed |
-| `npm audit` | not run separately (network). `npm install` reported "found 0 vulnerabilities" during the approved install |
-| Real S3 / manual phone check | **not run** (forbidden in this session / M4) |
+| Processes / temp | no demo, `node --test` or Chrome processes left; scratch dir `$TMPDIR/fm-m3` removed at the end |
+| Real S3 / phone / network | **not used** (M4; forbidden here). The only HTTP was to 127.0.0.1 |
 
 ## Incomplete, deferred and open items
-- **Not done here (by instruction):** independent review, commit, push, M3, M4 (real S3, phone).
-- **Unproven against real S3:** multipart part sizes, `IfNoneMatch` conditional writes (S3 has supported them
-  since 2024), `CopySource` encoding, the presigned URL's host and region style, `HeadObject` on a missing bucket
-  (real S3 returns a bodiless 404 `NotFound` for HEAD, so a missing bucket may look like a missing file there; the
-  later operation then fails as a storage error).
-- **Known, out of scope (unchanged):** an ordinary error can be replaced by a later overlapping success in the
-  same folder (M1 gap); the lockfile's top-level `name` (`file-manager`) differs from `package.json`.
-- **Deleting or moving the last file out of an implicit folder** (no marker) makes that folder disappear; the
-  reload then reports "This folder does not exist" with the success. That's S3 prefix semantics (D11); not changed.
-- **Uploading into a non-existent prefix** through the API creates it implicitly (S3 semantics); the UI now only
-  uploads into a folder that loaded successfully (F4).
-- **Not covered by D23:** creating a folder where a file of that name exists (M1 path, unchanged), and objects
-  written outside the app. The collision check is not atomic with the S3 write (two concurrent requests could race).
-- **Oversize uploads far beyond the limit:** a client that keeps streaming far past the request limit may get a
-  connection reset instead of the 413 (the server stops reading; Node's client drops the response on `EPIPE`).
-  In the UI that shows as "Upload failed: the connection was lost." A body up to 2× the limit gets its 413
-  (tested). The UI doesn't know the limit, so it can't warn before sending.
-- **The upload list grows** for the life of the page (by design, F3); there is no Clear button.
-- **`CopyObject` limit:** moving an object over 5 GB (only possible if uploaded outside the app) fails as a generic
-  `STORAGE_ERROR`.
-- **Git remote** `origin` exists; Eve should confirm it was authorised (review risk). Not used here.
+- **Remaining milestone:** M4 (real S3 + physical phone). The independent-review verdict is maintained separately
+  in `docs/CLAUDE_REVIEW.md`.
+- **Unproven against real S3:** that S3 honours `response-content-type`/`response-content-disposition` on these
+  presigned URLs (documented S3 behaviour, signed by the SDK; the fake only reflects the query), the ranged `GetObject`,
+  and the amazonaws.com host style for the bucket (the CSP allows any `*.amazonaws.com` host, which covers
+  virtual-hosted and path-style URLs but **not** China regions, `amazonaws.com.cn`).
+- **Phones:** iOS Safari may show only the first page of a PDF in a frame (hence "Open the PDF in a new tab"); only
+  headless Chrome at phone width was tested, not a real phone (M4).
+- **Back button with a preview open** closes the preview *and* goes back a folder (the preview adds no history entry).
+- **Text detection is by extension:** a binary file named `.txt` shows replacement characters; non-UTF-8 text
+  (e.g. Latin-1) shows U+FFFD for non-ASCII bytes.
+- **A broken image** shows the browser's broken-image icon with its alt text under the error message.
+- Carried over from M2 (unchanged): filenames with `"` stored percent-encoded; many tiny files in one API request start
+  S3 uploads concurrently; uppercase `Host` refused by
+  the Origin check; an ordinary error can be replaced by a later overlapping success (M1 gap); lockfile `name` differs
+  from `package.json`; deleting/moving the last file out of an implicit folder removes the folder; check-then-act races
+  for move and name collisions; the upload list grows for the page's life.
 
 ## Risks
-- **Security:** still no login. `127.0.0.1` by default, the Host guard against DNS rebinding, and now the
-  `Origin` check against cross-site writes. **Never expose it to the internet.**
-- **Data:** uploads and moves never overwrite; deletes are permanent without bucket versioning. A partial move
-  leaves both copies (reported). Check-then-act races remain for move (the destination check isn't atomic:
-  CopyObject has no destination precondition here).
-- **Cost/cleanup:** a failed abort leaves multipart parts until a lifecycle rule removes them (logged; README
-  tip). The presigned URL is valid for 5 minutes for anyone who has it.
-- **Privacy:** server logs hold raw S3 errors, keys of failed operations and malformed-upload reasons; local only.
-- **Browser tests:** they need local Chrome; they use fixed delays (300–900 ms; the progress test uses an 8 MiB
-  file and a 600 ms server delay) that could be flaky on a slow machine.
+- **Security:** still no login (D2); never expose it to the internet. M3 widens the page CSP only for images and frames
+  from `*.amazonaws.com` (anyone's bucket there could be framed/imaged, but the page only sets URLs the API returns;
+  scripts stay same-origin). Presigned preview URLs work for 5 minutes for anyone who has them, like downloads.
+- **Memory:** a text preview reads at most 1 MiB per request; the JSON is about that size.
+- **Browser tests:** fixed delays (300–900 ms) could be flaky on a slow machine; the PDF test relies on Chrome's built-in
+  PDF viewer extension id (`mhjfbmdgcfjbbpaeojofohoefgiehjai`).
 
-## Next recommended step
-1. Eve reviews the follow-ups (F1–F4), D21–D23 and the `CLAUDE.md` update.
-2. A fresh, independent, read-only re-review. Expect `npm test` to show 317 pass, 0 skipped.
-3. Commit only with explicit approval; no push. M3 only after M2 is accepted.
+## Documentation follow-up
+Completed with Mr. So's approval: `CLAUDE.md` now records `src/preview.js`, the preview routes/storage contract, and
+the preview stale-response rule (`previewSeq` + abort; closed on navigation, Close and Escape). D24 now records the
+approval explicitly, and the M3 threshold is consistently described as 1 MiB.
+
+## Release gate
+Use `docs/CLAUDE_REVIEW.md` for the current independent-review verdict. After a PASS, Eve reruns the deterministic
+gates. Commit and push require explicit approval; M4 is Mr. So's real-S3 and physical-phone checklist.

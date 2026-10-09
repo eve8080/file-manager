@@ -37,6 +37,7 @@ Status: direction approved by Mr. So on 2026-10-08.
 | D21 | Cross-site write protection (`sameOriginWrites` in `src/app.js`, added during M2, acknowledged after the M2 review): any `/api` request other than GET/HEAD that carries an `Origin` header naming another host, or `Origin: null`, is refused with 403 `FORBIDDEN_ORIGIN` before any route runs. Reason: a multipart upload is a CORS "simple request" that browsers send cross-site without a preflight, so with no login (D2) any web page could write into the bucket through the user's browser; the Host guard (D9) does not stop this. The same-origin UI and clients that send no `Origin` (the AI agent, scripts) are unaffected. Tested: foreign, `null` and other-port origins are refused and store nothing; same-origin and no-`Origin` uploads succeed. |
 | D22 | Upload request limit (review follow-up, 2026-10-09): `MAX_UPLOAD_MB` limits each file **and** each upload request, whose body may be at most `MAX_UPLOAD_MB` + 64 KiB of multipart framing (so one file of exactly the limit always fits). A declared `Content-Length` over it → 413 `REQUEST_TOO_LARGE` before anything is read or stored. A chunked body is counted as it streams; at the limit, parsing stops, the file in flight fails with `REQUEST_TOO_LARGE` (its S3 multipart upload aborted), files before it are stored and reported, and the rest of the body is not read (`Connection: close`). No new configuration. |
 | D23 | File/folder name collisions (review follow-up, 2026-10-09): an upload or move may not give a file the visible name of an existing folder, nor put it under a path whose part is an existing file. Both → 409 `NAME_CONFLICT`, with the fixed messages "A folder with that name already exists" / "Part of that path is a file, not a folder". An existing file at the destination is still 409 `FILE_EXISTS` (checked first). The check is not atomic with the S3 write. Creating a folder where a file of that name exists is unchanged (M1). |
+| D24 | M3 preview (approved by Mr. So on 2026-10-09): the kind comes from the file extension only (`src/preview.js`): text (`txt`, `md`, `csv`, `json`, `html`, `svg`, … shown strictly as text via `textContent`), image (`jpg`/`jpeg`/`png`/`gif`/`webp`), PDF; anything else is `none` (download only). Text previews send at most the first 1 MiB (1,048,576 bytes; S3: one ranged GET), with `truncated: true` and a visible notice when the file is larger; a UTF-8 character cut by the limit is dropped. Image/PDF previews from real S3 are 5-minute presigned GET URLs that override `Content-Type` (from the extension, never the stored type) and `Content-Disposition: inline`. Memory/demo instead returns a same-origin URL, `GET /api/files/preview/content?key=` (bytes inline, typed by extension, `nosniff`, its own CSP `default-src 'none'; frame-ancestors 'self'` so the PDF can be framed; on S3 the same route 302s to the presigned URL). The page CSP adds `img-src`/`frame-src 'self' https://*.amazonaws.com`; scripts stay same-origin. No new dependency. |
 
 ## 3. Architecture
 ```
@@ -47,7 +48,7 @@ AI agent ────────────────┴─ HTTP JSON API �
 - Stack: Node.js >= 22.9, Express 5, `@aws-sdk/client-s3`, `@aws-sdk/s3-request-presigner` and `busboy`
   (both approved for M2, 2026-10-09), vanilla HTML/CSS/JS frontend, `node:test`.
 - Config (`.env`): `S3_BUCKET`, `AWS_REGION`, optional `AWS_PROFILE`, `HOST`, `PORT`, `MAX_UPLOAD_MB`.
-- Downloads / image previews (M2/M3): 5-minute presigned GET URLs. Text preview capped at 1 MB, rendered as text.
+- Downloads / image and PDF previews (M2/M3): 5-minute presigned GET URLs. Text preview capped at 1 MiB, rendered as text (D24).
 - Path rules (`src/paths.js`): no leading `/`, no empty / `.` / `..` segments, no control characters,
   no leading/trailing whitespace in a segment, max 1024 bytes.
 
@@ -65,6 +66,7 @@ Errors: `{ "error": { "code": "...", "message": "...", "details"?: {...} } }` wi
 | POST | `/api/files/move` `{ from, to }` | M2 | rename/move file |
 | DELETE | `/api/files?key=` | M2 | delete file |
 | GET | `/api/files/preview?key=` | M3 | `{ kind: text|image|pdf|none, text?, truncated?, url? }` |
+| GET | `/api/files/preview/content?key=` | M3 | image/PDF bytes inline (memory/demo); 302 to the presigned URL (S3); 400 for other kinds (D24) |
 
 ## 5. Milestones and acceptance criteria
 **M0 – Skeleton** (delivered together with M1)
@@ -110,7 +112,7 @@ Errors: `{ "error": { "code": "...", "message": "...", "details"?: {...} } }` wi
 
 **M3 – Preview**
 - Text / image / PDF preview; other types offer download
-- Tests: each kind; text > 1 MB truncated with notice; HTML content shown as text
+- Tests: each kind; text > 1 MiB truncated with notice; HTML content shown as text
 
 **M4 – Manual real-S3 check (Mr. So)**
 - Checklist run against the real bucket from desktop and phone on Wi-Fi

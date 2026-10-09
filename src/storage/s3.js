@@ -13,7 +13,7 @@ import {
   AbortMultipartUploadCommand,
 } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
-import { attachmentDisposition } from '../disposition.js';
+import { attachmentDisposition, inlineDisposition } from '../disposition.js';
 import {
   classifyStorageError,
   conflict,
@@ -25,10 +25,11 @@ import {
   storageReason,
 } from '../errors.js';
 import { ancestorPaths } from '../paths.js';
+import { PREVIEW_TEXT_BYTES, previewKind, textPreview } from '../preview.js';
 
 const DELETE_BATCH_SIZE = 1000; // S3 DeleteObjects limit
 const MAX_REPORTED_FAILURES = 20;
-const DOWNLOAD_URL_SECONDS = 5 * 60;
+const PRESIGNED_URL_SECONDS = 5 * 60; // downloads and image/PDF previews
 const UPLOAD_PART_BYTES = 8 * 1024 * 1024; // S3 requires at least 5 MiB for every part but the last
 
 // S3 storage driver. See src/storage/memory.js for the interface.
@@ -103,16 +104,26 @@ export function createS3Storage({
     return `${bucket}/${key.split('/').map(encodeURIComponent).join('/')}`;
   }
 
-  // True if the object exists. S3 answers HeadObject for a missing key with a bare 404 (`NotFound`).
-  // Other 404s (e.g. `NoSuchBucket`) are storage errors, not a missing file.
-  async function fileExists(key) {
+  // The object's HeadObject metadata, or undefined if it does not exist. S3 answers HeadObject for a
+  // missing key with a bare 404 (`NotFound`). Other 404s (e.g. `NoSuchBucket`) are storage errors.
+  async function headObject(key) {
     try {
-      await client.send(new HeadObjectCommand({ Bucket: bucket, Key: key }));
-      return true;
+      return await client.send(new HeadObjectCommand({ Bucket: bucket, Key: key }));
     } catch (err) {
-      if (err?.name === 'NotFound' || err?.name === 'NoSuchKey') return false;
+      if (err?.name === 'NotFound' || err?.name === 'NoSuchKey') return undefined;
       throw err;
     }
+  }
+
+  async function fileExists(key) {
+    return (await headObject(key)) !== undefined;
+  }
+
+  // A presigned GET URL for `key`, valid for 5 minutes. `overrides` set the headers S3 answers with
+  // (ResponseContentType, ResponseContentDisposition). Signing is local: no request is sent.
+  function presignGet(key, overrides) {
+    const command = new GetObjectCommand({ Bucket: bucket, Key: key, ...overrides });
+    return getSignedUrl(signingClient, command, { expiresIn: PRESIGNED_URL_SECONDS });
   }
 
   // NAME_CONFLICT if `key` is a folder's name, or a part of its path is a file. Not atomic with the
@@ -288,12 +299,37 @@ export function createS3Storage({
     // Signing is local; existence is checked first so a missing file is a 404 here, not an S3 error page.
     async getDownload(key) {
       if (!(await fileExists(key))) throw notFound('File not found');
-      const command = new GetObjectCommand({
-        Bucket: bucket,
-        Key: key,
-        ResponseContentDisposition: attachmentDisposition(key.split('/').pop()),
-      });
-      return { url: await getSignedUrl(signingClient, command, { expiresIn: DOWNLOAD_URL_SECONDS }) };
+      return { url: await presignGet(key, { ResponseContentDisposition: attachmentDisposition(key.split('/').pop()) }) };
+    },
+
+    // Images/PDFs: a presigned GET URL, valid for 5 minutes, that serves the object inline with the content
+    // type of its extension (uploads store none, and S3's stored type is never trusted for display).
+    // Text: only the first PREVIEW_TEXT_BYTES are fetched (a ranged GET; an empty object needs none, and S3
+    // refuses a range on it).
+    async getPreview(key) {
+      const head = await headObject(key);
+      if (head === undefined) throw notFound('File not found');
+      const preview = previewKind(key);
+      if (preview.kind === 'none') return preview;
+      if (preview.kind !== 'text') {
+        const url = await presignGet(key, {
+          ResponseContentType: preview.contentType,
+          ResponseContentDisposition: inlineDisposition(key.split('/').pop()),
+        });
+        return { ...preview, url };
+      }
+      const size = head.ContentLength ?? 0;
+      if (size === 0) return textPreview(new Uint8Array(0), 0);
+      let object;
+      try {
+        object = await client.send(
+          new GetObjectCommand({ Bucket: bucket, Key: key, Range: `bytes=0-${PREVIEW_TEXT_BYTES - 1}` }),
+        );
+      } catch (err) {
+        if (err?.name === 'NoSuchKey') throw notFound('File not found'); // deleted since the HEAD
+        throw err;
+      }
+      return textPreview(await object.Body.transformToByteArray(), size);
     },
 
     // S3 has no rename: copy, then delete the source. The source is deleted only after the copy succeeded.

@@ -6,10 +6,12 @@ import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createApp } from '../src/app.js';
+import { PREVIEW_TEXT_BYTES } from '../src/preview.js';
 import { createMemoryStorage } from '../src/storage/memory.js';
 import { createS3Storage } from '../src/storage/s3.js';
 import { findChrome, launchChrome } from './helpers/chrome.js';
-import { FakeS3Client } from './helpers/fake-s3-client.js';
+import { FakeS3Client, TEST_SIGNER } from './helpers/fake-s3-client.js';
+import { PNG_1X1, minimalPdf, solidPng } from './helpers/fixtures.js';
 
 const chromePath = findChrome();
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -21,6 +23,8 @@ describe('browser UI', { skip: chromePath ? false : 'Chrome not found (set CHROM
   let dialogs; // every alert/confirm/prompt the page opened: { type, message }
   let listCalls; // every prefix the server was asked to list, in order
   let failNextLists; // number of upcoming list calls that fail with a simulated S3 outage (502)
+  let previewDelays; // key -> ms, to make chosen preview requests slow
+  let failNextPreviews; // number of upcoming preview calls that fail with a simulated S3 outage (502)
   let server;
   let baseUrl;
   let chrome;
@@ -59,6 +63,15 @@ describe('browser UI', { skip: chromePath ? false : 'Chrome not found (set CHROM
         await sleep(mutationDelay);
         return storage.putFile(...args);
       },
+      // M3: previews can be slowed per key, or made to fail like an S3 outage.
+      getPreview: async (key) => {
+        if (previewDelays.has(key)) await sleep(previewDelays.get(key));
+        if (failNextPreviews > 0) {
+          failNextPreviews -= 1;
+          throw Object.assign(new Error('simulated outage'), { name: 'ServiceUnavailable', $metadata: { httpStatusCode: 503 } });
+        }
+        return storage.getPreview(key);
+      },
     };
     server = createApp({ storage: proxy }).listen(0, '127.0.0.1');
     await new Promise((resolve) => server.once('listening', resolve));
@@ -80,6 +93,8 @@ describe('browser UI', { skip: chromePath ? false : 'Chrome not found (set CHROM
     listDelays = new Map();
     listCalls = [];
     failNextLists = 0;
+    previewDelays = new Map();
+    failNextPreviews = 0;
     mutationDelay = 0;
     dialogs = [];
     answer = () => ({ accept: true });
@@ -684,13 +699,13 @@ describe('browser UI', { skip: chromePath ? false : 'Chrome not found (set CHROM
           name: HOSTILE,
           download: `/api/files/download?key=${encodeURIComponent(`docs/${HOSTILE}`)}`,
           downloadLabel: `Download ${HOSTILE}`,
-          buttons: [`Rename file ${HOSTILE}`, `Delete file ${HOSTILE}`],
+          buttons: [`Preview ${HOSTILE}`, `Rename file ${HOSTILE}`, `Delete file ${HOSTILE}`],
         },
         {
           name: 'report final 2026.pdf',
           download: `/api/files/download?key=${encodeURIComponent('docs/report final 2026.pdf')}`,
           downloadLabel: 'Download report final 2026.pdf',
-          buttons: ['Rename file report final 2026.pdf', 'Delete file report final 2026.pdf'],
+          buttons: ['Preview report final 2026.pdf', 'Rename file report final 2026.pdf', 'Delete file report final 2026.pdf'],
         },
       ]);
       assert.equal(await page.evaluate(`document.querySelectorAll('#listing img').length`), 0, 'no injected element');
@@ -849,7 +864,7 @@ describe('browser UI', { skip: chromePath ? false : 'Chrome not found (set CHROM
           await waitLoaded('docs/');
           const targets = await page.evaluate(`[...document.querySelectorAll('#listing .row.file a.download, #listing .row.file button')]
             .map((el) => { const r = el.getBoundingClientRect(); return { what: el.getAttribute('aria-label'), width: r.width, height: r.height }; })`);
-          assert.equal(targets.length, 6);
+          assert.equal(targets.length, 8); // per file: Preview (M3), Download, Rename, Delete
           for (const t of targets) assert.ok(t.width >= 44 && t.height >= 44, `${t.what}: ${t.width}x${t.height}`);
           assert.equal(await page.evaluate('document.documentElement.scrollWidth > window.innerWidth'), false);
         } finally {
@@ -1124,6 +1139,418 @@ describe('browser UI', { skip: chromePath ? false : 'Chrome not found (set CHROM
         }
       });
     }
+  });
+
+  describe('M3: preview', () => {
+    const HOSTILE_NAME = '<img src=x onerror="window.__xssName=1">.html';
+    const HOSTILE_HTML = '<script>window.__xss = 1</script><img src=x onerror="window.__xss = 2"><b>bold</b> &amp; <iframe src="/"></iframe>';
+    beforeEach(() => {
+      storage = createMemoryStorage({
+        'docs/': '',
+        'docs/notes.txt': 'Hello\n  indented\tand tabbed\nÉté 🌍',
+        [`docs/${HOSTILE_NAME}`]: HOSTILE_HTML,
+        'other/': '',
+        'other/o.txt': 'o',
+      });
+    });
+
+    // Matched by exact label (a hostile name's quotes would break an attribute selector).
+    const clickPreview = (name) =>
+      page.evaluate(`[...document.querySelectorAll('#listing button')].find((b) => b.getAttribute('aria-label') === ${JSON.stringify(`Preview ${name}`)}).click()`);
+    const previewState = () =>
+      page.evaluate(`(() => {
+        const dialog = document.getElementById('preview');
+        const body = document.getElementById('preview-body');
+        const message = document.getElementById('preview-message');
+        return {
+          open: dialog.open,
+          state: dialog.dataset.state ?? null,
+          title: document.getElementById('preview-title').textContent,
+          message: message.textContent,
+          messageIsError: message.classList.contains('error'),
+          text: body.querySelector('pre')?.textContent ?? null,
+          img: body.querySelector('img')?.getAttribute('src') ?? null,
+          frame: body.querySelector('iframe')?.getAttribute('src') ?? null,
+          download: document.getElementById('preview-download').getAttribute('href'),
+          downloadLabel: document.getElementById('preview-download').getAttribute('aria-label'),
+        };
+      })()`);
+    const previewSettled = () =>
+      page.waitFor(`document.getElementById('preview').open && document.getElementById('preview').dataset.state !== 'loading'`, {
+        message: 'preview settled',
+      });
+    const downloadHref = (key) => `/api/files/download?key=${encodeURIComponent(key)}`;
+
+    it('text: Preview opens a dialog with the exact text, the file name and a Download link', async () => {
+      await open('#/docs/');
+      await waitLoaded('docs/');
+      await clickPreview('notes.txt');
+      await previewSettled();
+      assert.deepEqual(await previewState(), {
+        open: true,
+        state: 'ready',
+        title: 'notes.txt',
+        message: '',
+        messageIsError: false,
+        text: 'Hello\n  indented\tand tabbed\nÉté 🌍',
+        img: null,
+        frame: null,
+        download: downloadHref('docs/notes.txt'),
+        downloadLabel: 'Download notes.txt',
+      });
+      // Closing returns to the listing, unchanged.
+      await page.evaluate(`document.getElementById('preview-close').click()`);
+      assert.equal((await previewState()).open, false);
+      assert.equal((await state()).status, '');
+      assert.deepEqual(page.errors, []);
+    });
+
+    it('HTML content and a hostile file name are shown as text, never as markup or script', async () => {
+      await open('#/docs/');
+      await waitLoaded('docs/');
+      await clickPreview(HOSTILE_NAME);
+      await previewSettled();
+      const s = await previewState();
+      assert.equal(s.text, HOSTILE_HTML);
+      assert.equal(s.title, HOSTILE_NAME);
+      const injected = await page.evaluate(`({
+        elements: document.querySelectorAll('#preview script, #preview img, #preview b, #preview iframe').length,
+        xss: window.__xss ?? null,
+        xssName: window.__xssName ?? null,
+      })`);
+      assert.deepEqual(injected, { elements: 0, xss: null, xssName: null });
+      assert.deepEqual(dialogs, []);
+      assert.deepEqual(page.errors, []);
+    });
+
+    const TRUNCATED_NOTICE = 'This file is larger than 1 MB, so only the first 1 MB is shown. Download it to see all of it.';
+
+    it('text over 1 MiB: the first 1 MiB is shown with a visible notice; exactly 1 MiB has none', async () => {
+      storage.putObject('docs/exact.txt', 'e'.repeat(PREVIEW_TEXT_BYTES));
+      storage.putObject('docs/big.log', `${'b'.repeat(PREVIEW_TEXT_BYTES)}TAIL`);
+      await open('#/docs/');
+      await waitLoaded('docs/');
+      await clickPreview('big.log');
+      await previewSettled();
+      let s = await previewState();
+      assert.equal(s.message, TRUNCATED_NOTICE);
+      assert.equal(s.messageIsError, false);
+      assert.equal(s.text.length, PREVIEW_TEXT_BYTES);
+      assert.ok(!s.text.includes('TAIL'));
+      assert.equal(s.download, downloadHref('docs/big.log'), 'the whole file stays downloadable');
+      const visible = await page.evaluate(`(() => { const r = document.getElementById('preview-message').getBoundingClientRect(); return r.width > 0 && r.height > 0 && r.top >= 0 && r.bottom <= innerHeight; })()`);
+      assert.equal(visible, true, 'the notice is on screen');
+
+      await clickPreviewInDialogFor('exact.txt');
+      s = await previewState();
+      assert.equal(s.message, '');
+      assert.equal(s.text.length, PREVIEW_TEXT_BYTES);
+    });
+
+    // Closes the open preview and opens another file's.
+    async function clickPreviewInDialogFor(name) {
+      await page.evaluate(`document.getElementById('preview-close').click()`);
+      await clickPreview(name);
+      await previewSettled();
+    }
+
+    const contentUrl = (key) => `/api/files/preview/content?key=${encodeURIComponent(key)}`;
+
+    it('image: shown as an <img> from the preview URL, with the file name as its alt text', async () => {
+      storage.putObject('docs/Pixel 1.PNG', PNG_1X1);
+      await open('#/docs/');
+      await waitLoaded('docs/');
+      await clickPreview('Pixel 1.PNG');
+      await previewSettled();
+      const s = await previewState();
+      assert.equal(s.img, contentUrl('docs/Pixel 1.PNG'));
+      assert.deepEqual([s.message, s.text, s.frame, s.download], ['', null, null, downloadHref('docs/Pixel 1.PNG')]);
+      await page.waitFor(`document.querySelector('#preview-body img').complete`);
+      const img = await page.evaluate(`(() => { const i = document.querySelector('#preview-body img'); return { alt: i.alt, width: i.naturalWidth, height: i.naturalHeight }; })()`);
+      assert.deepEqual(img, { alt: 'Pixel 1.PNG', width: 1, height: 1 }, 'the image really loaded (CSP allowed it)');
+    });
+
+    it('image that cannot be decoded: an error in the dialog, Download still offered', async () => {
+      storage.putObject('docs/fake.jpg', 'not really a jpeg');
+      await open('#/docs/');
+      await waitLoaded('docs/');
+      await clickPreview('fake.jpg');
+      await page.waitFor(`document.getElementById('preview-message').classList.contains('error')`, { message: 'image error shown' });
+      const s = await previewState();
+      assert.equal(s.message, 'This image could not be displayed. Download it to open it in another app.');
+      assert.equal(s.messageIsError, true);
+      assert.equal(s.download, downloadHref('docs/fake.jpg'));
+      assert.equal((await state()).status, '', 'the folder status is untouched');
+    });
+
+    it('PDF: shown in a frame that Chrome\'s PDF viewer renders, plus an "open in a new tab" link', async () => {
+      storage.putObject('docs/Report 2026.pdf', minimalPdf());
+      await open('#/docs/');
+      await waitLoaded('docs/');
+      const pdfViewerLoaded = async () =>
+        (await page.send('Target.getTargets')).targetInfos.some((t) => t.url.startsWith('chrome-extension://mhjfbmdgcfjbbpaeojofohoefgiehjai/'));
+      assert.equal(await pdfViewerLoaded(), false, 'no PDF viewer before the preview');
+      await clickPreview('Report 2026.pdf');
+      await previewSettled();
+      const s = await previewState();
+      assert.equal(s.frame, contentUrl('docs/Report 2026.pdf'));
+      assert.deepEqual([s.message, s.text, s.img], ['', null, null]);
+      const extras = await page.evaluate(`(() => {
+        const frame = document.querySelector('#preview-body iframe');
+        const link = document.querySelector('#preview-body a.open-pdf');
+        return { title: frame.title, href: link?.getAttribute('href'), target: link?.target, rel: link?.rel, text: link?.textContent };
+      })()`);
+      assert.deepEqual(extras, {
+        title: 'PDF preview of Report 2026.pdf',
+        href: contentUrl('docs/Report 2026.pdf'),
+        target: '_blank',
+        rel: 'noopener noreferrer',
+        text: 'Open the PDF in a new tab',
+      });
+      // Chrome's PDF viewer is an extension frame; its appearance means the PDF was not blocked (CSP, framing).
+      const deadline = Date.now() + 5000;
+      let viewer = false;
+      while (!viewer && Date.now() < deadline) {
+        viewer = await pdfViewerLoaded();
+        if (!viewer) await sleep(100);
+      }
+      assert.ok(viewer, 'Chrome\'s PDF viewer loaded the file');
+    });
+
+    it('errors: a file removed meanwhile, or an S3 outage, is shown in the dialog only; the folder status is untouched', async () => {
+      const originalError = console.error;
+      console.error = () => {}; // the server logs the simulated outage
+      try {
+        await open('#/docs/');
+        await waitLoaded('docs/');
+        await storage.deleteFile('docs/notes.txt'); // removed elsewhere after the listing loaded
+        await clickPreview('notes.txt');
+        await previewSettled();
+        let s = await previewState();
+        assert.deepEqual([s.state, s.message, s.messageIsError, s.text], ['error', 'This file no longer exists.', true, null]);
+
+        failNextPreviews = 1;
+        await clickPreviewInDialogFor(HOSTILE_NAME);
+        s = await previewState();
+        assert.deepEqual([s.state, s.message, s.messageIsError, s.text], ['error', 'S3 is temporarily unavailable.', true, null]);
+        assert.equal(s.download, downloadHref(`docs/${HOSTILE_NAME}`), 'Download is still offered');
+        assert.deepEqual([(await state()).status, (await state()).statusIsError], ['', false]);
+        assert.deepEqual(page.errors, []);
+      } finally {
+        console.error = originalError;
+      }
+    });
+
+    // Stale responses: like folder loads, only the preview on screen may render. A late response never
+    // reappears after the dialog was closed, the user navigated, or another file's preview was opened.
+    describe('stale preview responses', () => {
+      const SLOW = 500;
+      const closed = async () => {
+        const s = await previewState();
+        const children = await page.evaluate(`document.getElementById('preview-body').childElementCount`);
+        return { open: s.open, children, message: s.message };
+      };
+
+      it('navigating while a preview loads closes it; the late response is ignored; the new folder is untouched', async () => {
+        previewDelays.set('docs/notes.txt', SLOW);
+        await open('#/docs/');
+        await waitLoaded('docs/');
+        await clickPreview('notes.txt');
+        await sleep(50);
+        await page.evaluate(`location.hash = '#/other/'`);
+        await waitLoaded('other/');
+        assert.equal((await previewState()).open, false, 'closed on navigation');
+        await sleep(SLOW + 300);
+        assert.deepEqual(await closed(), { open: false, children: 0, message: '' });
+        const s = await state();
+        assert.deepEqual([s.prefix, s.names, s.status], ['other/', ['o.txt'], '']);
+        assert.deepEqual(page.errors, []);
+      });
+
+      it('the back button (e.g. on a phone) while a preview loads closes it too', async () => {
+        previewDelays.set('other/o.txt', SLOW);
+        await open('#/docs/');
+        await waitLoaded('docs/');
+        await page.evaluate(`location.hash = '#/other/'`);
+        await waitLoaded('other/');
+        await clickPreview('o.txt');
+        await sleep(50);
+        await page.evaluate('history.back()');
+        await waitLoaded('docs/');
+        await sleep(SLOW + 300);
+        assert.deepEqual(await closed(), { open: false, children: 0, message: '' });
+      });
+
+      it('closing while a preview loads: the late response does not fill the closed dialog', async () => {
+        previewDelays.set('docs/notes.txt', SLOW);
+        await open('#/docs/');
+        await waitLoaded('docs/');
+        await clickPreview('notes.txt');
+        await sleep(50);
+        await page.evaluate(`document.getElementById('preview-close').click()`);
+        await sleep(SLOW + 300);
+        assert.deepEqual(await closed(), { open: false, children: 0, message: '' });
+      });
+
+      it('Escape closes the dialog and discards its late response too', async () => {
+        previewDelays.set('docs/notes.txt', SLOW);
+        await open('#/docs/');
+        await waitLoaded('docs/');
+        await clickPreview('notes.txt');
+        await sleep(50);
+        for (const type of ['keyDown', 'keyUp']) {
+          await page.send('Input.dispatchKeyEvent', { type, key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 });
+        }
+        await page.waitFor(`!document.getElementById('preview').open`, { message: 'Escape closed the dialog' });
+        await sleep(SLOW + 300);
+        assert.deepEqual(await closed(), { open: false, children: 0, message: '' });
+      });
+
+      it('a slow preview of one file never replaces the preview of the file opened after it', async () => {
+        previewDelays.set('docs/notes.txt', SLOW);
+        await open('#/docs/');
+        await waitLoaded('docs/');
+        await clickPreview('notes.txt');
+        await sleep(50);
+        await clickPreviewInDialogFor(HOSTILE_NAME);
+        await sleep(SLOW + 300);
+        const s = await previewState();
+        assert.deepEqual([s.title, s.text, s.message, s.download], [HOSTILE_NAME, HOSTILE_HTML, '', downloadHref(`docs/${HOSTILE_NAME}`)]);
+        assert.equal(await page.evaluate(`document.querySelectorAll('#preview-body pre').length`), 1);
+      });
+
+      it('a late image error from a closed preview does not mark the next preview as failed', async () => {
+        storage.putObject('docs/fake.jpg', 'not really a jpeg');
+        previewDelays.set('docs/fake.jpg', 300); // both the JSON and the image bytes are slow
+        await open('#/docs/');
+        await waitLoaded('docs/');
+        await clickPreview('fake.jpg');
+        await page.waitFor(`document.querySelector('#preview-body img')`, { message: 'image element added' });
+        await clickPreviewInDialogFor('notes.txt'); // the old image is still loading
+        await sleep(600); // past the old image's failure
+        const s = await previewState();
+        assert.deepEqual([s.title, s.message, s.messageIsError], ['notes.txt', '', false]);
+      });
+    });
+
+    for (const [label, width] of [['phone', 375], ['desktop', 1280]]) {
+      it(`usable on a ${label} (${width}px): the dialog fits, long text wraps, wide images and PDFs scale, controls ≥ 44×44`, async () => {
+        const longName = `${'very-long-file-name-'.repeat(8)}.txt`;
+        storage.putObject(`docs/${longName}`, `${'x'.repeat(4000)}\n${'word '.repeat(800)}`);
+        storage.putObject('docs/wide.png', solidPng(3000, 20));
+        storage.putObject('docs/doc.pdf', minimalPdf());
+        await page.setViewport(width, 800);
+        try {
+          await open('#/docs/');
+          await waitLoaded('docs/');
+          const layout = () =>
+            page.evaluate(`(() => {
+              const box = (el) => { const r = el.getBoundingClientRect(); return { left: r.left, right: r.right, top: r.top, bottom: r.bottom, width: r.width, height: r.height }; };
+              const body = document.getElementById('preview-body');
+              const media = body.querySelector('pre, img, iframe');
+              return {
+                dialog: box(document.getElementById('preview')),
+                controls: ['preview-close', 'preview-download'].map((id) => box(document.getElementById(id))),
+                title: box(document.getElementById('preview-title')),
+                media: media && box(media),
+                preOverflows: body.querySelector('pre') ? body.querySelector('pre').scrollWidth > body.querySelector('pre').clientWidth : null,
+                pageScrolls: document.documentElement.scrollWidth > innerWidth,
+                viewport: innerWidth,
+              };
+            })()`);
+          const fits = (b, what, viewport) => assert.ok(b.left >= 0 && b.right <= viewport + 0.5, `${what} fits: ${b.left}..${b.right} of ${viewport}`);
+
+          await clickPreview(longName);
+          await previewSettled();
+          let l = await layout();
+          fits(l.dialog, 'dialog', l.viewport);
+          fits(l.title, 'long title', l.viewport);
+          fits(l.media, 'text', l.viewport);
+          assert.equal(l.preOverflows, false, 'long lines wrap');
+          assert.equal(l.pageScrolls, false, 'no horizontal page scrolling');
+          for (const c of l.controls) assert.ok(c.width >= 44 && c.height >= 44, `control ${c.width}x${c.height}`);
+
+          for (const name of ['wide.png', 'doc.pdf']) {
+            await clickPreviewInDialogFor(name);
+            if (name === 'wide.png') await page.waitFor(`document.querySelector('#preview-body img').complete`);
+            l = await layout();
+            fits(l.media, name, l.viewport);
+            assert.ok(l.media.width > 0 && l.media.height > 0, `${name} is visible`);
+            assert.equal(l.pageScrolls, false, `${name}: no horizontal page scrolling`);
+          }
+          const openPdf = await page.evaluate(`(() => { const r = document.querySelector('#preview-body a.open-pdf').getBoundingClientRect(); return { width: r.width, height: r.height }; })()`);
+          assert.ok(openPdf.width >= 44 && openPdf.height >= 44, `open-PDF link ${openPdf.width}x${openPdf.height}`);
+        } finally {
+          await page.setViewport(375, 740);
+        }
+      });
+    }
+
+    // Real S3 driver (fake client): the dialog uses the presigned amazonaws.com URL, and the page CSP lets
+    // it load. Chrome resolves no host names (test/helpers/chrome.js) and every amazonaws.com request is
+    // intercepted here and answered from the fake bucket, so nothing reaches the network.
+    it('S3: image and PDF previews load from presigned amazonaws.com URLs (intercepted locally)', async () => {
+      const client = new FakeS3Client({ 'pics/': '', 'pics/p.png': PNG_1X1, 'pics/d.pdf': minimalPdf() });
+      storage = createS3Storage({ bucket: 'test-bucket', client, signingClient: TEST_SIGNER });
+      const intercepted = [];
+      const onPaused = (msg) => {
+        if (msg.method !== 'Fetch.requestPaused') return;
+        const { requestId, request } = msg.params;
+        const url = new URL(request.url);
+        if (url.hostname === '127.0.0.1') return void page.send('Fetch.continueRequest', { requestId }).catch(() => {});
+        intercepted.push(request.url);
+        const object = url.hostname === 'test-bucket.s3.us-east-1.amazonaws.com' && client.objects.get(decodeURIComponent(url.pathname.slice(1)));
+        if (!object) return void page.send('Fetch.failRequest', { requestId, errorReason: 'BlockedByClient' }).catch(() => {});
+        page.send('Fetch.fulfillRequest', {
+          requestId,
+          responseCode: 200,
+          responseHeaders: [{ name: 'Content-Type', value: url.searchParams.get('response-content-type') }],
+          body: object.body.toString('base64'),
+        }).catch(() => {});
+      };
+      page.listeners.add(onPaused);
+      await page.send('Fetch.enable', { patterns: [{ urlPattern: '*' }] });
+      try {
+        await open('#/pics/');
+        await waitLoaded('pics/');
+        await clickPreview('p.png');
+        await previewSettled();
+        const src = (await previewState()).img;
+        assert.equal(new URL(src).hostname, 'test-bucket.s3.us-east-1.amazonaws.com');
+        assert.equal(new URL(src).searchParams.get('X-Amz-Expires'), '300');
+        await page.waitFor(`document.querySelector('#preview-body img').complete`);
+        assert.equal(await page.evaluate(`document.querySelector('#preview-body img').naturalWidth`), 1, 'the S3 image loaded (CSP allowed it)');
+        assert.equal(intercepted.length, 1);
+
+        await clickPreviewInDialogFor('d.pdf');
+        const frame = (await previewState()).frame;
+        assert.equal(new URL(frame).searchParams.get('response-content-type'), 'application/pdf');
+        await page.waitFor(`document.querySelector('#preview-body iframe')`);
+        const deadline = Date.now() + 5000;
+        while (!intercepted.some((u) => u.startsWith('https://test-bucket.s3.us-east-1.amazonaws.com/pics/d.pdf'))) {
+          assert.ok(Date.now() < deadline, `the PDF frame requested its presigned URL (CSP frame-src allowed it): ${intercepted}`);
+          await sleep(50);
+        }
+        assert.deepEqual(page.errors, []);
+      } finally {
+        await page.send('Fetch.disable');
+        page.listeners.delete(onPaused);
+      }
+    });
+
+    it('other types: no preview, a clear message, and Download', async () => {
+      storage.putObject('docs/archive.zip', 'PK');
+      await open('#/docs/');
+      await waitLoaded('docs/');
+      await clickPreview('archive.zip');
+      await previewSettled();
+      const s = await previewState();
+      assert.equal(s.message, 'No preview is available for this type of file. Use Download to get it.');
+      assert.equal(s.messageIsError, false);
+      assert.deepEqual([s.text, s.img, s.frame], [null, null, null]);
+      assert.equal(s.download, downloadHref('docs/archive.zip'));
+      assert.equal(await page.evaluate(`document.getElementById('preview-body').childElementCount`), 0);
+    });
   });
 
   describe('M1 closure: N4 sorting and toolbar touch targets', () => {

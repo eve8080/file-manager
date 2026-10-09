@@ -1,9 +1,10 @@
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import express from 'express';
-import { attachmentDisposition } from './disposition.js';
+import { attachmentDisposition, inlineDisposition } from './disposition.js';
 import { badRequest, toPublicError } from './errors.js';
 import { folderName, parseFileKey, parseFolderPath, parsePrefix } from './paths.js';
+import { previewKind } from './preview.js';
 import { receiveUploads } from './upload.js';
 
 const PUBLIC_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'public');
@@ -77,6 +78,33 @@ export function createApp({ storage, maxUploadBytes = DEFAULT_MAX_UPLOAD_BYTES }
       'Content-Disposition': attachmentDisposition(key.split('/').pop()),
     });
     res.send(download.body);
+  });
+
+  // { kind: 'text', text, truncated } | { kind: 'image'|'pdf', url } | { kind: 'none' }. S3's url is a
+  // 5-minute presigned inline GET; memory/demo gets a same-origin URL (below) so tests never touch AWS.
+  api.get('/files/preview', async (req, res) => {
+    const key = parseFileKey(queryParam(req, 'key'));
+    const { kind, text, truncated, url } = await storage.getPreview(key);
+    res.set('Cache-Control', 'no-store');
+    if (kind === 'text') return res.json({ kind, text, truncated });
+    if (kind === 'none') return res.json({ kind });
+    res.json({ kind, url: url ?? `/api/files/preview/content?key=${encodeURIComponent(key)}` });
+  });
+
+  // An image/PDF preview's bytes, inline, typed by extension (with nosniff, never as HTML). Memory/demo
+  // serves them; S3 redirects to its presigned URL. Its own CSP lets only this app frame it (PDF viewer).
+  api.get('/files/preview/content', async (req, res) => {
+    const key = parseFileKey(queryParam(req, 'key'));
+    if (!['image', 'pdf'].includes(previewKind(key).kind)) throw badRequest('Only images and PDFs have preview content');
+    const { contentType, url, body } = await storage.getPreview(key);
+    res.set('Cache-Control', 'no-store');
+    if (url) return res.redirect(302, url);
+    res.set({
+      'Content-Type': contentType,
+      'Content-Disposition': inlineDisposition(key.split('/').pop()),
+      'Content-Security-Policy': "default-src 'none'; frame-ancestors 'self'",
+    });
+    res.send(body);
   });
 
   api.post('/files/move', async (req, res) => {
@@ -172,10 +200,15 @@ function sameOriginWrites(req, res, next) {
   sendError(res, 403, 'FORBIDDEN_ORIGIN', 'Cross-site requests are not allowed');
 }
 
+// Image and PDF previews from real S3 load from presigned URLs on the bucket's amazonaws.com host
+// (decision D24), so images and frames may also come from there; scripts and everything else stay same-origin.
+const S3_PREVIEW_SOURCE = 'https://*.amazonaws.com';
+
 function securityHeaders(req, res, next) {
   res.set({
     'Content-Security-Policy':
-      "default-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
+      `default-src 'self'; img-src 'self' ${S3_PREVIEW_SOURCE}; frame-src 'self' ${S3_PREVIEW_SOURCE}; ` +
+      "object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
     'X-Content-Type-Options': 'nosniff',
     'Referrer-Policy': 'no-referrer',
   });

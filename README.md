@@ -5,8 +5,8 @@ A small personal web file manager for one private AWS S3 bucket, usable from a d
 > ⚠ **No login.** Anyone who can reach the app has full access to the bucket.
 > Run it only on your own machine or a trusted Wi-Fi. Never expose it to the internet.
 
-Status: Milestone 2 (folders, plus upload, download, rename/move and delete of files). Previews come in a later
-milestone — see `IMPLEMENTATION_BRIEF.md`.
+Status: Milestone 3 (folders; upload, download, rename/move and delete of files; preview of text, images and
+PDFs). See `IMPLEMENTATION_BRIEF.md`.
 
 ## Prerequisites
 - Node.js 22.9 or newer
@@ -62,7 +62,8 @@ npm test           # uses in-memory storage and a fake S3 client; never touches 
 ```
 `npm test` includes browser regression tests (`test/browser.test.js`) that drive a headless Chrome with a
 throwaway profile. They find Chrome in `/Applications` or the usual Linux paths, or use `CHROME_PATH`.
-If no Chrome is found they are reported as **skipped**, not passed. `test/chrome-helper.test.js` checks the
+If no Chrome is found they are reported as **skipped**, not passed. The test Chrome resolves no host names
+(only `127.0.0.1` is reachable), so it can never contact AWS or the internet. `test/chrome-helper.test.js` checks the
 browser helper's own process handling (startup timeout, early exit, shutdown hang) with fake Chrome scripts.
 
 ## API (for scripts / AI agent)
@@ -79,6 +80,18 @@ Errors are returned as `{ "error": { "code": "...", "message": "...", "details"?
 | GET | `/api/files/download?key=Documents/a.pdf` | real S3: 302 to a presigned download URL valid for 5 minutes. Demo: the file itself as an attachment |
 | POST | `/api/files/move` with JSON `{ "from": "Documents/a.pdf", "to": "Archive/a.pdf" }` | rename/move; 404 if `from` is missing, 409 `FILE_EXISTS` if `to` exists, 409 `NAME_CONFLICT` if `to` is a folder's name or goes through a file. On S3 this is copy-then-delete: if the copy worked but the original could not be removed, **502 `MOVE_INCOMPLETE`** with `details: { from, to, copied, sourceDeleted, reason }` (the file then exists under both names) |
 | DELETE | `/api/files?key=Documents/a.pdf` | deletes one file; 404 if missing |
+| GET | `/api/files/preview?key=Documents/a.pdf` | `{ kind: "text", text, truncated }`, `{ kind: "image" \| "pdf", url }` or `{ kind: "none" }` (see below); 404 if missing |
+| GET | `/api/files/preview/content?key=Photos/a.png` | the image/PDF shown inline. Demo: the bytes; real S3: 302 to the presigned URL. 400 for other types |
+
+**Preview.** The type comes from the file extension: text (`txt`, `md`, `csv`, `tsv`, `log`, `json`, `xml`, `yaml`,
+`html`, `css`, `js`, `svg`, …), images (`jpg`, `jpeg`, `png`, `gif`, `webp`) and PDF. Everything else is
+`none`: the UI offers Download only. Text previews contain at most the first 1 MiB of the file; a larger file
+has `truncated: true` and the UI says so. Text, including HTML, is always shown as plain characters, never
+rendered or run. On real S3, `url` is a presigned link valid for 5 minutes that serves the file inline with the
+type of its extension; in the demo it is a local `/api/files/preview/content` link. The page's Content
+Security Policy allows images and frames from `https://*.amazonaws.com` for this (scripts stay same-origin).
+In the UI, every file row has a Preview button; the preview opens in a dialog (full screen on a phone) with
+Download and Close, and closes when you navigate to another folder (including the Back button).
 
 A file can't take a folder's name, and its path can't pass through a file: uploads and moves that would do
 so get 409 `NAME_CONFLICT` ("A folder with that name already exists" / "Part of that path is a file, not a

@@ -10,6 +10,12 @@ const els = {
   uploadInput: document.getElementById('upload-input'),
   uploads: document.getElementById('uploads'),
   uploadLabel: document.querySelector('label.upload'),
+  preview: document.getElementById('preview'),
+  previewTitle: document.getElementById('preview-title'),
+  previewDownload: document.getElementById('preview-download'),
+  previewClose: document.getElementById('preview-close'),
+  previewMessage: document.getElementById('preview-message'),
+  previewBody: document.getElementById('preview-body'),
 };
 
 // Invariant: current.prefix always equals the folder in the URL hash (see load()).
@@ -86,6 +92,10 @@ function el(tag, className, text) {
   if (className) node.className = className;
   if (text !== undefined) node.textContent = text;
   return node;
+}
+
+function downloadUrl(key) {
+  return `/api/files/download?key=${encodeURIComponent(key)}`;
 }
 
 function formatSize(bytes) {
@@ -166,8 +176,12 @@ function renderListing() {
     const name = el('span', 'name', file.name);
     name.prepend(el('span', 'icon', '📄'));
     const actions = el('span', 'actions');
+    const preview = el('button', null, 'Preview');
+    preview.type = 'button';
+    preview.setAttribute('aria-label', `Preview ${file.name}`);
+    preview.addEventListener('click', () => openPreview(file));
     const download = el('a', 'button download', 'Download');
-    download.href = `/api/files/download?key=${encodeURIComponent(file.key)}`;
+    download.href = downloadUrl(file.key);
     download.setAttribute('aria-label', `Download ${file.name}`);
     const rename = el('button', null, 'Rename');
     rename.type = 'button';
@@ -177,7 +191,7 @@ function renderListing() {
     del.type = 'button';
     del.setAttribute('aria-label', `Delete file ${file.name}`);
     del.addEventListener('click', () => deleteFile(file));
-    actions.append(download, rename, del);
+    actions.append(preview, download, rename, del);
     row.append(name, el('span', 'meta', `${formatSize(file.size)} · ${formatDate(file.modified)}`), actions);
     els.listing.append(row);
   }
@@ -396,11 +410,103 @@ function uploadOne(prefix, file, progress) {
   });
 }
 
+// ---- Preview ----
+
+// The server sends at most the first 1 MiB of a text file (PREVIEW_TEXT_BYTES) and says if it cut it.
+const TRUNCATED_NOTICE = 'This file is larger than 1 MB, so only the first 1 MB is shown. Download it to see all of it.';
+
+function setPreviewMessage(message, isError = false) {
+  els.previewMessage.textContent = message;
+  els.previewMessage.classList.toggle('error', isError);
+}
+
+// Only the preview on screen may update the dialog, like folder loads (see load()): opening another
+// preview, closing (button or Escape) and navigating all increment this and abort the request in flight.
+let previewSeq = 0;
+let previewController = null;
+
+function endPreview() {
+  previewSeq += 1;
+  previewController?.abort();
+  previewController = null;
+  els.previewBody.replaceChildren(); // also stops a PDF or image that is still loading
+  setPreviewMessage('');
+  els.preview.dataset.state = 'closed';
+}
+
+// Opens the preview dialog for a file. Download is always offered. Text is inserted with textContent
+// only, so HTML in a file is shown as characters, never parsed.
+async function openPreview(file) {
+  endPreview();
+  const seq = previewSeq;
+  const controller = new AbortController();
+  previewController = controller;
+  els.previewTitle.textContent = file.name;
+  els.previewDownload.href = downloadUrl(file.key);
+  els.previewDownload.setAttribute('aria-label', `Download ${file.name}`);
+  els.preview.dataset.state = 'loading';
+  setPreviewMessage('Loading preview…');
+  if (!els.preview.open) els.preview.showModal();
+  try {
+    const data = await api('GET', `/api/files/preview?key=${encodeURIComponent(file.key)}`, undefined, controller.signal);
+    if (seq !== previewSeq) return;
+    renderPreview(file, data, () => seq === previewSeq);
+    els.preview.dataset.state = 'ready';
+  } catch (err) {
+    if (seq !== previewSeq || err.name === 'AbortError') return;
+    // Shown in the dialog only: the folder's status line is not the preview's to change.
+    setPreviewMessage(err.status === 404 ? 'This file no longer exists.' : err.message, true);
+    els.preview.dataset.state = 'error';
+  }
+}
+
+// `data` is the API's { kind, text?, truncated?, url? }. Image and PDF URLs come from the server (same
+// origin, or a short-lived presigned S3 URL) and are only ever used as src/href. `isCurrent()` guards
+// events that arrive later (an image failing to decode).
+function renderPreview(file, data, isCurrent) {
+  setPreviewMessage('');
+  if (data.kind === 'text') {
+    if (data.truncated) setPreviewMessage(TRUNCATED_NOTICE);
+    els.previewBody.append(el('pre', 'preview-text', data.text));
+  } else if (data.kind === 'image') {
+    const img = el('img');
+    img.alt = file.name;
+    img.addEventListener('error', () => {
+      if (isCurrent()) setPreviewMessage('This image could not be displayed. Download it to open it in another app.', true);
+    });
+    img.src = data.url;
+    els.previewBody.append(img);
+  } else if (data.kind === 'pdf') {
+    // Phones may show only the first page in a frame, so the PDF can also be opened on its own.
+    const frame = el('iframe');
+    frame.title = `PDF preview of ${file.name}`;
+    frame.src = data.url;
+    const link = el('a', 'button open-pdf', 'Open the PDF in a new tab');
+    link.href = data.url;
+    link.target = '_blank';
+    link.rel = 'noopener noreferrer';
+    els.previewBody.append(frame, link);
+  } else {
+    setPreviewMessage('No preview is available for this type of file. Use Download to get it.');
+  }
+}
+
+function closePreview() {
+  endPreview();
+  if (els.preview.open) els.preview.close();
+}
+
+els.previewClose.addEventListener('click', closePreview);
+// Escape closes the dialog natively. The 'close' event is queued, so a preview opened since is left alone.
+els.preview.addEventListener('close', () => {
+  if (!els.preview.open) endPreview();
+});
 els.uploadInput.addEventListener('change', uploadFiles);
 els.newFolderForm.addEventListener('submit', createFolder);
 els.sort.addEventListener('change', renderListing);
 window.addEventListener('hashchange', () => {
   navSeq += 1;
+  closePreview(); // a preview belongs to the folder it was opened in (also the phone's back button)
   const dropped = pendingReports;
   pendingReports = [];
   load();

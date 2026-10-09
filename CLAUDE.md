@@ -16,17 +16,21 @@ If code and these documents disagree, stop and ask rather than silently picking 
 - `src/server.js` — entry point (real S3); `src/demo.js` — in-memory demo, no AWS
 - `src/start.js` — `start(storage, config, label)`: builds the app (incl. `MAX_UPLOAD_MB`) for both entry points and listens
 - `src/app.js` — Express app factory `createApp({ storage, maxUploadBytes })`: API routes, host guard (D9),
-  cross-site write guard `sameOriginWrites` (D21), security headers, error handler, upload result reporting
+  cross-site write guard `sameOriginWrites` (D21), preview metadata/content routes (D24), security headers,
+  error handler, upload result reporting
 - `src/upload.js` — streams multipart uploads (busboy) into `storage.putFile`; per-file and per-request limits (D22),
   malformed/cut-off bodies, client disconnects
-- `src/disposition.js` — `Content-Disposition: attachment` header for downloads
+- `src/preview.js` — extension-based preview kinds and the 1 MiB text-preview cap (D24)
+- `src/disposition.js` — safe `Content-Disposition` headers for attachment downloads and inline previews
 - `src/config.js` — reads env (`.env` loaded via `node --env-file-if-exists`)
 - `src/paths.js` — validates/normalises every folder path; file keys are validated exactly (`parseFileKey`)
 - `src/errors.js` — `AppError` (status + code + optional details); API errors are `{ "error": { "code", "message", "details"? } }`;
   `toPublicError()` turns any error into its client-facing form
-- `src/storage/` — storage interface (documented in `memory.js`): list, folders, `putFile`/`getDownload`/`moveFile`/`deleteFile`.
-  `s3.js` (AWS SDK v3: multipart upload with abort-on-failure, presigned 5-minute downloads, copy-then-delete moves),
-  `memory.js` (tests/demo). Uploads/moves never overwrite (`FILE_EXISTS`) or collide with folder names (`NAME_CONFLICT`, D23)
+- `src/storage/` — storage interface (documented in `memory.js`): list, folders,
+  `putFile`/`getDownload`/`getPreview`/`moveFile`/`deleteFile`. `s3.js` uses AWS SDK v3 for multipart
+  upload with abort-on-failure, presigned 5-minute downloads/previews, ranged text previews and copy-then-delete
+  moves; `memory.js` powers tests/demo. Uploads/moves never overwrite (`FILE_EXISTS`) or collide with folder names
+  (`NAME_CONFLICT`, D23)
 - `public/` — static single page (vanilla JS); talks only to `/api/*`. Uploads use one XHR per file (per-file progress)
 - `test/` — `node --test`; contract tests run against memory storage AND s3 storage with a fake S3 client;
   `test/browser.test.js` drives the UI in headless Chrome (`test/helpers/chrome.js`, no dependencies);
@@ -47,7 +51,8 @@ If code and these documents disagree, stop and ask rather than silently picking 
 - The UI must ignore stale async responses (`public/app.js`): list loads (`load()`, sequence number + abort; only the
   current load may enable upload) and every mutation completion — folder create/delete, file upload/rename/delete —
   checked with `navigationToken()` (D16: after navigation they never change the new folder's status; a partial
-  folder delete is alerted). The upload list keeps every file's result across overlapping uploads and navigation
+  folder delete is alerted). Preview loads use `previewSeq` plus an abort controller and are closed/invalidated on
+  navigation, Close and Escape (D24). The upload list keeps every file's result across overlapping uploads and navigation
 - Destructive bulk operations are confirmed server-side, not only in the browser
 - Never render user-controlled content as HTML in the frontend — use `textContent`
 - Validate all paths/keys server-side via `src/paths.js`

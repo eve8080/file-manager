@@ -5,6 +5,7 @@ import {
   DeleteObjectCommand,
   HeadObjectCommand,
   CopyObjectCommand,
+  GetObjectCommand,
   CreateMultipartUploadCommand,
   UploadPartCommand,
   CompleteMultipartUploadCommand,
@@ -15,7 +16,9 @@ import {
 // Minimal in-process stand-in for S3Client, implementing just the commands the S3 driver uses,
 // with S3's semantics where the driver depends on them:
 // - listing: sorted keys, Prefix, Delimiter/CommonPrefixes, MaxKeys pagination (`pageSize` forces small pages)
-// - HeadObject / CopyObject on a missing key: 404 `NotFound` / `NoSuchKey`
+// - HeadObject / CopyObject / GetObject on a missing key: 404 `NotFound` / `NoSuchKey` / `NoSuchKey`
+// - GetObject `Range: bytes=a-b` (b clamped to the end; a range on an empty object is 416 `InvalidRange`);
+//   the Body offers the SDK's `transformToByteArray()`
 // - PutObject / CompleteMultipartUpload with `IfNoneMatch: '*'` on an existing key: 412 `PreconditionFailed`
 // - multipart uploads: every part except the last must be at least `minPartSize` bytes (S3: 5 MiB), else
 //   CompleteMultipartUpload fails with `EntityTooSmall`; an unknown UploadId gives `NoSuchUpload`
@@ -88,6 +91,7 @@ export class FakeS3Client {
       this.put(input.Key, source.body);
       return { CopyObjectResult: { ETag: '"etag"' } };
     }
+    if (command instanceof GetObjectCommand) return this.#get(input);
     if (command instanceof CreateMultipartUploadCommand) {
       const UploadId = `upload-${this.nextUploadId++}`;
       this.uploads.set(UploadId, { key: input.Key, parts: new Map() });
@@ -127,6 +131,28 @@ export class FakeS3Client {
     const upload = this.uploads.get(UploadId);
     if (!upload || upload.key !== Key) throw s3Error('NoSuchUpload', 404);
     return upload;
+  }
+
+  #get({ Key, Range }) {
+    const object = this.objects.get(Key);
+    if (!object) throw s3Error('NoSuchKey', 404);
+    let body = object.body;
+    let contentRange;
+    if (Range !== undefined) {
+      const match = /^bytes=(\d+)-(\d+)$/.exec(Range);
+      if (!match) throw new Error(`FakeS3Client: unsupported Range ${Range}`);
+      const start = Number(match[1]);
+      if (start >= body.length) throw s3Error('InvalidRange', 416);
+      const end = Math.min(Number(match[2]), body.length - 1);
+      contentRange = `bytes ${start}-${end}/${body.length}`;
+      body = body.subarray(start, end + 1);
+    }
+    const bytes = Buffer.from(body);
+    return {
+      ContentLength: bytes.length,
+      ContentRange: contentRange,
+      Body: { transformToByteArray: async () => new Uint8Array(bytes) },
+    };
   }
 
   #precondition({ IfNoneMatch, Key }) {
