@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { PREVIEW_TEXT_BYTES, previewKind } from '../src/preview.js';
+import { PREVIEW_TEXT_BYTES, needsNormalizing, previewKind } from '../src/preview.js';
 
 describe('previewKind (M3)', () => {
   const cases = {
@@ -28,5 +28,14 @@ describe('previewKind (M3)', () => {
 
   it('caps text previews at exactly 1 MiB', () => {
     assert.equal(PREVIEW_TEXT_BYTES, 1024 * 1024);
+  });
+});
+
+describe('needsNormalizing (M4: JPEG previews are converted on demand)', () => {
+  it('is true for .jpg / .jpeg in any case, and only for them', () => {
+    for (const key of ['a.jpg', 'a.jpeg', 'Photos/IMG_0001.JPG', 'x.JpEg', 'dir.png/photo.jpg']) assert.equal(needsNormalizing(key), true, key);
+    for (const key of ['a.png', 'a.gif', 'a.webp', 'a.pdf', 'a.txt', 'a.zip', 'a.heic', '.jpg', 'jpg', 'a.jpg.png', 'a.jpg.', 'a']) {
+      assert.equal(needsNormalizing(key), false, key);
+    }
   });
 });

@@ -12,7 +12,7 @@ from a desktop or phone browser.
 If code and these documents disagree, stop and ask rather than silently picking one.
 
 ## Architecture
-- Node.js (>= 22.9) + Express 5, ES modules, plain JavaScript, no build step
+- Node.js (>= 22.9) + Express 5, ES modules, plain JavaScript, no build step; `sharp` (D25) converts JPEG previews
 - `src/server.js` — entry point (real S3); `src/demo.js` — in-memory demo, no AWS
 - `src/start.js` — `start(storage, config, label)`: builds the app (incl. `MAX_UPLOAD_MB`) for both entry points and listens
 - `src/app.js` — Express app factory `createApp({ storage, maxUploadBytes })`: API routes, host guard (D9),
@@ -20,21 +20,27 @@ If code and these documents disagree, stop and ask rather than silently picking 
   error handler, upload result reporting
 - `src/upload.js` — streams multipart uploads (busboy) into `storage.putFile`; per-file and per-request limits (D22),
   malformed/cut-off bodies, client disconnects
-- `src/preview.js` — extension-based preview kinds and the 1 MiB text-preview cap (D24)
+- `src/preview.js` — extension-based preview kinds, the 1 MiB text-preview cap (D24) and `needsNormalizing(key)` (`.jpg`/`.jpeg`)
+- `src/jpeg-preview.js` — the only user of `sharp`: `normalizeJpeg(bytes)` (EXIF-rotate, fit inside 2048 px without enlarging,
+  sRGB, baseline JPEG, no metadata/gain map; JPEG signature and 128 MP checked first; any failure → fixed
+  `PREVIEW_FAILED`, raw error only logged) and `createLimiter` (at most 2 conversions at once) (D25)
 - `src/disposition.js` — safe `Content-Disposition` headers for attachment downloads and inline previews
 - `src/config.js` — reads env (`.env` loaded via `node --env-file-if-exists`)
 - `src/paths.js` — validates/normalises every folder path; file keys are validated exactly (`parseFileKey`)
 - `src/errors.js` — `AppError` (status + code + optional details); API errors are `{ "error": { "code", "message", "details"? } }`;
   `toPublicError()` turns any error into its client-facing form
 - `src/storage/` — storage interface (documented in `memory.js`): list, folders,
-  `putFile`/`getDownload`/`getPreview`/`moveFile`/`deleteFile`. `s3.js` uses AWS SDK v3 for multipart
+  `putFile`/`getDownload`/`getPreview`/`readPreviewSource`/`moveFile`/`deleteFile`. `s3.js` uses AWS SDK v3 for multipart
   upload with abort-on-failure, presigned 5-minute downloads/previews, ranged text previews and copy-then-delete
-  moves; `memory.js` powers tests/demo. Uploads/moves never overwrite (`FILE_EXISTS`) or collide with folder names
-  (`NAME_CONFLICT`, D23)
+  moves; `memory.js` powers tests/demo. JPEG previews (D25): `getPreview` returns only `{ kind, contentType }` (S3: one HEAD, no
+  presigning) and the content route calls `readPreviewSource(key, MAX_UPLOAD_MB)` (S3: one unranged GET, size-checked from the
+  headers and while reading) then `normalizeJpeg`; originals are never rewritten and no derivative is stored.
+  Uploads/moves never overwrite (`FILE_EXISTS`) or collide with folder names (`NAME_CONFLICT`, D23)
 - `public/` — static single page (vanilla JS); talks only to `/api/*`. Uploads use one XHR per file (per-file progress)
 - `test/` — `node --test`; contract tests run against memory storage AND s3 storage with a fake S3 client;
   `test/browser.test.js` drives the UI in headless Chrome (`test/helpers/chrome.js`, no dependencies);
-  `test/chrome-helper.test.js` tests that helper's process lifecycle with fake Chrome scripts;
+  `test/jpeg-preview.test.js` covers the converter on synthetic P3/EXIF/MPF/gain-map JPEGs (`test/helpers/jpeg-fixtures.js`;
+  never a real photo); `test/chrome-helper.test.js` tests that helper's process lifecycle with fake Chrome scripts;
   `test/start.test.js` runs the real entry points to check startup logging
 
 ## Commands
@@ -56,6 +62,9 @@ If code and these documents disagree, stop and ask rather than silently picking 
 - Destructive bulk operations are confirmed server-side, not only in the browser
 - Never render user-controlled content as HTML in the frontend — use `textContent`
 - Validate all paths/keys server-side via `src/paths.js`
+- JPEG previews (`.jpg`/`.jpeg`) are never served as stored and never get a presigned URL: they go through
+  `normalizeJpeg` (D25). Keep `sharp` confined to `src/jpeg-preview.js`; never write a converted copy to S3 or to
+  disk; keep the source bounded by `MAX_UPLOAD_MB` and conversions limited; PNG/GIF/WebP/PDF stay untouched
 - Don't leak internal error details to clients; log them server-side. Storage failures reach clients only as
   the fixed reasons in `STORAGE_REASONS` (`src/errors.js`), never as raw SDK names, S3 codes or messages
 

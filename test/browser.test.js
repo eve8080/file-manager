@@ -12,6 +12,7 @@ import { createS3Storage } from '../src/storage/s3.js';
 import { findChrome, launchChrome } from './helpers/chrome.js';
 import { FakeS3Client, TEST_SIGNER } from './helpers/fake-s3-client.js';
 import { PNG_1X1, minimalPdf, solidPng } from './helpers/fixtures.js';
+import { jpegFixture } from './helpers/jpeg-fixtures.js';
 
 const chromePath = findChrome();
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -23,7 +24,8 @@ describe('browser UI', { skip: chromePath ? false : 'Chrome not found (set CHROM
   let dialogs; // every alert/confirm/prompt the page opened: { type, message }
   let listCalls; // every prefix the server was asked to list, in order
   let failNextLists; // number of upcoming list calls that fail with a simulated S3 outage (502)
-  let previewDelays; // key -> ms, to make chosen preview requests slow
+  let previewDelays; // key -> ms, to make chosen preview requests slow (the JSON, and a JPEG's bytes)
+  let contentDelays; // key -> ms, to make only a JPEG's converted bytes slow
   let failNextPreviews; // number of upcoming preview calls that fail with a simulated S3 outage (502)
   let server;
   let baseUrl;
@@ -72,6 +74,12 @@ describe('browser UI', { skip: chromePath ? false : 'Chrome not found (set CHROM
         }
         return storage.getPreview(key);
       },
+      // M4: the source of a converted JPEG preview, slowed like the preview JSON (or on its own by contentDelays).
+      readPreviewSource: async (key, maxBytes) => {
+        const delay = contentDelays.get(key) ?? previewDelays.get(key);
+        if (delay) await sleep(delay);
+        return storage.readPreviewSource(key, maxBytes);
+      },
     };
     server = createApp({ storage: proxy }).listen(0, '127.0.0.1');
     await new Promise((resolve) => server.once('listening', resolve));
@@ -94,6 +102,7 @@ describe('browser UI', { skip: chromePath ? false : 'Chrome not found (set CHROM
     listCalls = [];
     failNextLists = 0;
     previewDelays = new Map();
+    contentDelays = new Map();
     failNextPreviews = 0;
     mutationDelay = 0;
     dialogs = [];
@@ -1272,15 +1281,149 @@ describe('browser UI', { skip: chromePath ? false : 'Chrome not found (set CHROM
 
     it('image that cannot be decoded: an error in the dialog, Download still offered', async () => {
       storage.putObject('docs/fake.jpg', 'not really a jpeg');
-      await open('#/docs/');
-      await waitLoaded('docs/');
-      await clickPreview('fake.jpg');
-      await page.waitFor(`document.getElementById('preview-message').classList.contains('error')`, { message: 'image error shown' });
-      const s = await previewState();
-      assert.equal(s.message, 'This image could not be displayed. Download it to open it in another app.');
-      assert.equal(s.messageIsError, true);
-      assert.equal(s.download, downloadHref('docs/fake.jpg'));
-      assert.equal((await state()).status, '', 'the folder status is untouched');
+      const originalError = console.error;
+      console.error = () => {}; // the server logs the failed conversion
+      try {
+        await open('#/docs/');
+        await waitLoaded('docs/');
+        await clickPreview('fake.jpg');
+        await page.waitFor(`document.getElementById('preview-message').classList.contains('error')`, { message: 'image error shown' });
+        const s = await previewState();
+        assert.equal(s.message, 'This image could not be displayed. Download it to open it in another app.');
+        assert.equal(s.messageIsError, true);
+        assert.equal(s.download, downloadHref('docs/fake.jpg'));
+        assert.equal((await state()).status, '', 'the folder status is untouched');
+      } finally {
+        console.error = originalError;
+      }
+    });
+
+    // ---- M4: JPEGs are converted on demand (max 2048 px, sRGB, no gain map) so iPhone Safari can show them ----
+
+    describe('M4: JPEG previews', () => {
+      // 3000x2000 Display P3 photo with EXIF rotation and an HDR gain map; the preview must be 1365x2048.
+      let photo;
+      before(async () => {
+        photo = await jpegFixture({ width: 3000, height: 2000, p3: true, orientation: 6, gainMap: true });
+      });
+      const imgInfo = () =>
+        page.evaluate(`(async () => {
+          const img = document.querySelector('#preview-body img');
+          const canvas = document.createElement('canvas');
+          canvas.width = img.naturalWidth;
+          canvas.height = img.naturalHeight;
+          const context = canvas.getContext('2d');
+          context.drawImage(img, 0, 0);
+          const [r, g, b] = context.getImageData(canvas.width >> 1, canvas.height >> 1, 1, 1).data;
+          const box = img.getBoundingClientRect();
+          const res = await fetch(img.currentSrc);
+          return {
+            src: img.getAttribute('src'),
+            alt: img.alt,
+            natural: [img.naturalWidth, img.naturalHeight],
+            pixel: [r, g, b],
+            left: box.left,
+            right: box.right,
+            viewport: innerWidth,
+            pageScrolls: document.documentElement.scrollWidth > innerWidth,
+            contentType: res.headers.get('content-type'),
+            bytes: (await res.arrayBuffer()).byteLength,
+          };
+        })()`);
+
+      it('phone width: the converted same-origin picture is shown (≤ 2048 px, rotated, sRGB colour) and the original stays downloadable unchanged', async () => {
+        storage.putObject('docs/IMG_0001.jpeg', photo);
+        await open('#/docs/');
+        await waitLoaded('docs/');
+        await clickPreview('IMG_0001.jpeg');
+        await previewSettled();
+        const s = await previewState();
+        assert.deepEqual([s.state, s.message, s.messageIsError, s.text, s.frame], ['ready', '', false, null, null]);
+        assert.equal(s.download, downloadHref('docs/IMG_0001.jpeg'), 'Download is offered');
+        const info = await imgInfo();
+        assert.equal(info.src, contentUrl('docs/IMG_0001.jpeg'), 'a same-origin URL, not a presigned one');
+        assert.deepEqual([info.alt, info.natural, info.contentType], ['IMG_0001.jpeg', [1365, 2048], 'image/jpeg']);
+        assert.ok(info.bytes < photo.length);
+        for (let i = 0; i < 3; i += 1) assert.ok(Math.abs(info.pixel[i] - [200, 100, 50][i]) <= 4, `sRGB colour ${info.pixel}`);
+        assert.ok(info.left >= 0 && info.right <= info.viewport + 0.5, `fits the phone: ${info.left}..${info.right} of ${info.viewport}`);
+        assert.equal(info.pageScrolls, false);
+        // The original is untouched in storage and downloads byte for byte.
+        const downloaded = await page.evaluate(`fetch(${JSON.stringify(downloadHref('docs/IMG_0001.jpeg'))}).then((r) => r.arrayBuffer()).then((b) => b.byteLength)`);
+        assert.equal(downloaded, photo.length);
+        assert.deepEqual((await storage.getDownload('docs/IMG_0001.jpeg')).body, photo);
+        assert.deepEqual(page.errors, []);
+      });
+
+      it('a corrupt .jpg: the error is shown in the dialog only, Download stays, the folder status is untouched', async () => {
+        storage.putObject('docs/cut.jpg', photo.subarray(0, 5000)); // a real JPEG cut off mid-file
+        storage.putObject('docs/IMG_0002.jpg', 'plain text named .jpg');
+        const originalError = console.error;
+        console.error = () => {}; // the server logs the decoder's error
+        try {
+          await open('#/docs/');
+          await waitLoaded('docs/');
+          for (const name of ['cut.jpg', 'IMG_0002.jpg']) {
+            if (name !== 'cut.jpg') await page.evaluate(`document.getElementById('preview-close').click()`);
+            await clickPreview(name);
+            await page.waitFor(`document.getElementById('preview-message').classList.contains('error')`, { message: `${name}: error shown` });
+            const s = await previewState();
+            assert.deepEqual([s.state, s.message, s.messageIsError], ['error', 'This image could not be displayed. Download it to open it in another app.', true], name);
+            assert.equal(s.download, downloadHref(`docs/${name}`), `${name}: Download is still offered`);
+            assert.deepEqual([(await state()).status, (await state()).statusIsError], ['', false]);
+          }
+          assert.deepEqual(page.errors, []);
+        } finally {
+          console.error = originalError;
+        }
+      });
+
+      it('a slow conversion keeps "Loading preview…" until the picture is there', async () => {
+        storage.putObject('docs/IMG_0003.jpg', photo);
+        contentDelays.set('docs/IMG_0003.jpg', 600);
+        await open('#/docs/');
+        await waitLoaded('docs/');
+        await clickPreview('IMG_0003.jpg');
+        await page.waitFor(`document.querySelector('#preview-body img')`, { message: 'image element added' });
+        let s = await previewState();
+        assert.deepEqual([s.state, s.message, s.messageIsError], ['loading', 'Loading preview…', false], 'still converting');
+        await previewSettled();
+        s = await previewState();
+        assert.deepEqual([s.state, s.message], ['ready', '']);
+        assert.deepEqual((await imgInfo()).natural, [1365, 2048]);
+      });
+
+      it('S3 driver: the picture comes from this app, not an amazonaws.com URL (no request leaves 127.0.0.1)', async () => {
+        const client = new FakeS3Client({ 'pics/': '', 'pics/IMG_0001.JPG': photo });
+        storage = createS3Storage({ bucket: 'test-bucket', client, signingClient: TEST_SIGNER });
+        const outside = [];
+        const onPaused = (msg) => {
+          if (msg.method !== 'Fetch.requestPaused') return;
+          const { requestId, request } = msg.params;
+          if (new URL(request.url).hostname === '127.0.0.1') return void page.send('Fetch.continueRequest', { requestId }).catch(() => {});
+          outside.push(request.url);
+          page.send('Fetch.failRequest', { requestId, errorReason: 'BlockedByClient' }).catch(() => {});
+        };
+        page.listeners.add(onPaused);
+        await page.send('Fetch.enable', { patterns: [{ urlPattern: '*' }] });
+        try {
+          await open('#/pics/');
+          await waitLoaded('pics/');
+          await clickPreview('IMG_0001.JPG');
+          await previewSettled();
+          const info = await imgInfo();
+          assert.equal(info.src, contentUrl('pics/IMG_0001.JPG'));
+          assert.deepEqual(info.natural, [1365, 2048]);
+          assert.deepEqual(outside, []);
+          // One HEAD for the preview JSON, then GETs of the photo only for the <img> (and this test's own fetch).
+          const s3Calls = client.calls.filter((c) => c !== 'ListObjectsV2Command');
+          assert.equal(s3Calls[0], 'HeadObjectCommand');
+          assert.ok(s3Calls.length >= 2 && s3Calls.slice(1).every((c) => c === 'GetObjectCommand'), s3Calls.join());
+          assert.deepEqual(page.errors, []);
+        } finally {
+          await page.send('Fetch.disable');
+          page.listeners.delete(onPaused);
+        }
+      });
     });
 
     it('PDF: shown in a frame that Chrome\'s PDF viewer renders, plus an "open in a new tab" link', async () => {
@@ -1422,14 +1565,20 @@ describe('browser UI', { skip: chromePath ? false : 'Chrome not found (set CHROM
       it('a late image error from a closed preview does not mark the next preview as failed', async () => {
         storage.putObject('docs/fake.jpg', 'not really a jpeg');
         previewDelays.set('docs/fake.jpg', 300); // both the JSON and the image bytes are slow
-        await open('#/docs/');
-        await waitLoaded('docs/');
-        await clickPreview('fake.jpg');
-        await page.waitFor(`document.querySelector('#preview-body img')`, { message: 'image element added' });
-        await clickPreviewInDialogFor('notes.txt'); // the old image is still loading
-        await sleep(600); // past the old image's failure
-        const s = await previewState();
-        assert.deepEqual([s.title, s.message, s.messageIsError], ['notes.txt', '', false]);
+        const originalError = console.error;
+        console.error = () => {}; // the server logs the failed conversion
+        try {
+          await open('#/docs/');
+          await waitLoaded('docs/');
+          await clickPreview('fake.jpg');
+          await page.waitFor(`document.querySelector('#preview-body img')`, { message: 'image element added' });
+          await clickPreviewInDialogFor('notes.txt'); // the old image is still loading
+          await sleep(600); // past the old image's failure
+          const s = await previewState();
+          assert.deepEqual([s.title, s.message, s.messageIsError], ['notes.txt', '', false]);
+        } finally {
+          console.error = originalError;
+        }
       });
     });
 

@@ -28,6 +28,12 @@ export function textPreview(firstBytes, size) {
   return { kind: 'text', text: new TextDecoder('utf-8').decode(bytes, { stream: truncated }), truncated };
 }
 
+// True for .jpg/.jpeg: their previews are not served as stored but converted on demand (src/jpeg-preview.js),
+// because an original with HDR gain-map/MPF data can fail to display on iPhone Safari (decision D25).
+export function needsNormalizing(key) {
+  return previewKind(key).contentType === 'image/jpeg';
+}
+
 // 'a/b.PNG' ->{ kind: 'image', contentType: 'image/png' }; { kind: 'text' }; { kind: 'none' }.
 export function previewKind(key) {
   const name = key.split('/').pop();

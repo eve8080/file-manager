@@ -3,10 +3,13 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import { createApp, isAllowedHost } from '../src/app.js';
 import { STORAGE_REASONS } from '../src/errors.js';
+import { MAX_CONCURRENT_CONVERSIONS } from '../src/jpeg-preview.js';
 import { PREVIEW_TEXT_BYTES } from '../src/preview.js';
 import { createMemoryStorage } from '../src/storage/memory.js';
 import { createS3Storage } from '../src/storage/s3.js';
 import { FakeS3Client, TEST_SIGNER } from './helpers/fake-s3-client.js';
+import { centrePixel, jpegFixture, jpegHeaderSegments } from './helpers/jpeg-fixtures.js';
+import sharp from 'sharp';
 
 let storage;
 let server;
@@ -454,9 +457,9 @@ describe('GET /api/files/preview (M3)', () => {
     assert.deepEqual((await preview('docs/r.pdf')).body, { kind: 'pdf', url: '/api/files/preview/content?key=docs%2Fr.pdf' });
   });
 
-  it('S3 image and PDF: the presigned 5-minute inline URL', async () => {
-    storage = createS3Storage({ bucket: 'test', client: new FakeS3Client({ 'p.jpg': 'j', 'd.pdf': 'p' }), signingClient: TEST_SIGNER });
-    for (const [key, kind, type] of [['p.jpg', 'image', 'image/jpeg'], ['d.pdf', 'pdf', 'application/pdf']]) {
+  it('S3 PNG, GIF, WebP and PDF: the presigned 5-minute inline URL (only JPEGs are converted, M4)', async () => {
+    storage = createS3Storage({ bucket: 'test', client: new FakeS3Client({ 'p.png': 'j', 'a.gif': 'g', 'w.webp': 'w', 'd.pdf': 'p' }), signingClient: TEST_SIGNER });
+    for (const [key, kind, type] of [['p.png', 'image', 'image/png'], ['a.gif', 'image', 'image/gif'], ['w.webp', 'image', 'image/webp'], ['d.pdf', 'pdf', 'application/pdf']]) {
       const res = await preview(key);
       assert.equal(res.status, 200);
       assert.deepEqual(Object.keys(res.body).sort(), ['kind', 'url']);
@@ -545,6 +548,213 @@ describe('GET /api/files/preview/content (M3, the memory/demo preview URL)', () 
     assert.equal((await get('key=docs/nope.png')).status, 404);
     for (const query of ['', 'key=docs/', 'key=../a.png', 'key=a&key=b', 'key[a]=x.png']) {
       assert.equal((await get(query)).status, 400, query);
+    }
+  });
+});
+
+describe('JPEG previews are converted on demand (M4)', () => {
+  const preview = (key) => call('GET', `/api/files/preview?key=${encodeURIComponent(key)}`);
+  const content = (key) => fetch(`${baseUrl}/api/files/preview/content?key=${encodeURIComponent(key)}`, { redirect: 'manual' });
+  const contentUrl = (key) => `/api/files/preview/content?key=${encodeURIComponent(key)}`;
+  const NORMAL_HEADERS = {
+    'content-type': 'image/jpeg',
+    'x-content-type-options': 'nosniff',
+    'cache-control': 'no-store',
+    'content-security-policy': "default-src 'none'; frame-ancestors 'self'",
+  };
+
+  // An iPhone-like photo: 3000x2000, Display P3, EXIF-rotated, HDR gain map in MPF/XMP.
+  let photo;
+  before(async () => {
+    photo = await jpegFixture({ width: 3000, height: 2000, p3: true, orientation: 6, gainMap: true });
+  });
+
+  // One scenario per driver; `calls()` lists the S3 requests made so far (none for memory).
+  const drivers = {
+    memory: (files) => ({ storage: createMemoryStorage(files), calls: () => [], objects: undefined }),
+    s3: (files) => {
+      const client = new FakeS3Client(files);
+      return { storage: createS3Storage({ bucket: 'test', client, signingClient: TEST_SIGNER }), calls: () => client.calls, objects: client.objects };
+    },
+  };
+
+  for (const [driver, make] of Object.entries(drivers)) {
+    describe(driver, () => {
+      it('metadata: a same-origin content URL for .jpg, .JPEG and .jpeg - never a presigned URL', async () => {
+        ({ storage } = make({ 'Photos/IMG_0001.jpg': photo, 'Photos/B 2.JPEG': photo, 'c.jpeg': photo }));
+        for (const key of ['Photos/IMG_0001.jpg', 'Photos/B 2.JPEG', 'c.jpeg']) {
+          const res = await preview(key);
+          assert.equal(res.status, 200, key);
+          assert.deepEqual(res.body, { kind: 'image', url: contentUrl(key) }, key);
+          assert.ok(!/amazonaws|X-Amz/i.test(JSON.stringify(res.body)), 'no presigned URL is exposed');
+          assert.equal(res.headers.get('cache-control'), 'no-store');
+        }
+      });
+
+      it('content: a 200 image/jpeg of at most 2048 px, sRGB, rotated, with no metadata or gain map', async () => {
+        ({ storage } = make({ 'Photos/IMG_0001.jpg': photo }));
+        const res = await content('Photos/IMG_0001.jpg');
+        assert.equal(res.status, 200, 'served itself, not redirected');
+        assert.equal(res.headers.get('location'), null);
+        for (const [name, value] of Object.entries(NORMAL_HEADERS)) assert.equal(res.headers.get(name), value, name);
+        assert.match(res.headers.get('content-disposition'), /^inline; filename="IMG_0001\.jpg"/);
+        const body = Buffer.from(await res.arrayBuffer());
+        const metadata = await sharp(body).metadata();
+        assert.deepEqual([metadata.format, metadata.width, metadata.height, metadata.space], ['jpeg', 1365, 2048, 'srgb']);
+        assert.deepEqual(jpegHeaderSegments(body).filter((s) => ['APP1', 'APP2'].includes(s.name)), []);
+        assert.equal(metadata.gainMap, undefined);
+        assert.ok(body.length < photo.length);
+        assert.deepEqual(await centrePixel(body).then((p) => p.map((v, i) => Math.abs(v - [200, 100, 50][i]) <= 4)), [true, true, true]);
+      });
+
+      it('the stored original is unchanged and still downloads byte for byte (MPF and gain map included)', async () => {
+        const made = make({ 'Photos/IMG_0001.jpg': photo });
+        storage = made.storage;
+        await preview('Photos/IMG_0001.jpg');
+        await content('Photos/IMG_0001.jpg');
+        if (made.objects) {
+          assert.deepEqual([...made.objects.keys()], ['Photos/IMG_0001.jpg']);
+          assert.deepEqual(made.objects.get('Photos/IMG_0001.jpg').body, photo);
+          assert.ok(!made.calls().some((c) => /^(Put|Copy|Delete|CreateMultipart|UploadPart|CompleteMultipart)/.test(c)), made.calls().join());
+        } else {
+          assert.deepEqual((await storage.getDownload('Photos/IMG_0001.jpg')).body, photo);
+        }
+        const download = await fetch(`${baseUrl}/api/files/download?key=Photos%2FIMG_0001.jpg`, { redirect: 'manual' });
+        if (download.status === 200) assert.deepEqual(Buffer.from(await download.arrayBuffer()), photo);
+        else assert.equal(download.status, 302, 'S3 downloads still redirect to a presigned URL');
+      });
+
+      it('a corrupt or unsupported .jpg is a clean 422 PREVIEW_FAILED with no decoder details, and the server keeps working', async () => {
+        ({ storage } = make({ 'bad.jpg': 'not really a jpeg', 'cut.jpg': photo.subarray(0, 700), 'ok.jpg': photo }));
+        const logged = await quietly(async () => {
+          for (const key of ['bad.jpg', 'cut.jpg']) {
+            const res = await content(key);
+            assert.equal(res.status, 422, key);
+            const body = await res.json();
+            assert.deepEqual(body, { error: { code: 'PREVIEW_FAILED', message: 'This image could not be converted for preview. Download it to open it in another app.' } }, key);
+            assert.ok(!/vips|sharp|premature|buffer/i.test(JSON.stringify(body)), 'no raw decoder text');
+            assert.equal(res.headers.get('x-content-type-options'), 'nosniff');
+          }
+        });
+        assert.ok(logged.length >= 1, 'the raw error is logged on the server');
+        assert.equal((await content('ok.jpg')).status, 200, 'the next request is served');
+        assert.equal((await call('GET', '/api/health')).status, 200);
+      });
+
+      it('metadata of a corrupt .jpg is still a normal preview URL (the failure is reported when the image is fetched)', async () => {
+        ({ storage } = make({ 'bad.jpg': 'not really a jpeg' }));
+        assert.deepEqual((await preview('bad.jpg')).body, { kind: 'image', url: contentUrl('bad.jpg') });
+      });
+
+      it('404 for a missing file; 400 for bad keys', async () => {
+        ({ storage } = make({ 'a.jpg': photo }));
+        assert.equal((await content('nope.jpg')).status, 404);
+        assert.equal((await preview('nope.jpg')).status, 404);
+        for (const query of ['', 'key=', 'key=%2Fa.jpg', 'key=a%01.jpg', 'key=a.jpg&key=b.jpg', 'key[a]=a.jpg']) {
+          const res = await fetch(`${baseUrl}/api/files/preview/content?${query}`, { redirect: 'manual' });
+          assert.equal(res.status, 400, query);
+        }
+      });
+    });
+  }
+
+  describe('S3 request behaviour', () => {
+    it('the metadata call is one HEAD; the photo is read (one GET) only when the content is requested', async () => {
+      const client = new FakeS3Client({ 'p.jpg': photo });
+      storage = createS3Storage({ bucket: 'test', client, signingClient: TEST_SIGNER });
+      await preview('p.jpg');
+      assert.deepEqual(client.calls, ['HeadObjectCommand'], 'listing the preview reads nothing');
+      await content('p.jpg');
+      assert.deepEqual(client.calls, ['HeadObjectCommand', 'GetObjectCommand']);
+      assert.equal(client.inputs[1].input.Range, undefined, 'the whole file is needed to convert it');
+    });
+
+    it('S3 failures on the content route are fixed STORAGE_ERROR reasons; NoSuchKey is a 404', async () => {
+      const client = new FakeS3Client({ 'p.jpg': photo });
+      storage = createS3Storage({ bucket: 'test', client, signingClient: TEST_SIGNER });
+      client.failNext('GetObjectCommand', { name: 'AccessDenied', status: 403, message: 'secret internal detail' });
+      let res;
+      const logged = await quietly(async () => {
+        res = await content('p.jpg');
+      });
+      assert.equal(res.status, 502);
+      const body = await res.json();
+      assert.deepEqual(body.error, { code: 'STORAGE_ERROR', message: STORAGE_REASONS.ACCESS_DENIED, details: { reason: 'ACCESS_DENIED' } });
+      assert.ok(!JSON.stringify(body).includes('secret internal detail'));
+      assert.match(String(logged[0]?.[0]?.message), /secret internal detail/);
+      client.failNext('GetObjectCommand', { name: 'NoSuchKey', status: 404 });
+      assert.equal((await content('p.jpg')).status, 404);
+    });
+  });
+
+  it('at most MAX_CONCURRENT_CONVERSIONS photos are read and converted at once, however many are requested', async () => {
+    const inner = createMemoryStorage({ 'a.jpg': await jpegFixture({ width: 200, height: 100 }) });
+    let reading = 0;
+    let peak = 0;
+    storage = new Proxy(inner, {
+      get: (target, method) =>
+        method === 'readPreviewSource'
+          ? async (...args) => {
+              reading += 1;
+              peak = Math.max(peak, reading);
+              await new Promise((resolve) => setTimeout(resolve, 40));
+              try {
+                return await target.readPreviewSource(...args);
+              } finally {
+                reading -= 1;
+              }
+            }
+          : target[method].bind(target),
+    });
+    const responses = await Promise.all(Array.from({ length: 3 * MAX_CONCURRENT_CONVERSIONS }, () => content('a.jpg')));
+    assert.deepEqual(responses.map((r) => r.status), Array(3 * MAX_CONCURRENT_CONVERSIONS).fill(200));
+    assert.equal(peak, MAX_CONCURRENT_CONVERSIONS);
+    assert.equal(MAX_CONCURRENT_CONVERSIONS, 2);
+  });
+
+  describe('other formats are unchanged', () => {
+    it('PNG, GIF, WebP and PDF on S3: the content route still redirects to the presigned URL', async () => {
+      storage = createS3Storage({ bucket: 'test', client: new FakeS3Client({ 'a.png': 'x', 'a.gif': 'x', 'a.webp': 'x', 'a.pdf': 'x' }), signingClient: TEST_SIGNER });
+      for (const key of ['a.png', 'a.gif', 'a.webp', 'a.pdf']) {
+        const res = await content(key);
+        assert.equal(res.status, 302, key);
+        assert.equal(new URL(res.headers.get('location')).searchParams.get('X-Amz-Expires'), '300', key);
+      }
+    });
+
+    it('memory PNG bytes are served as stored, not re-encoded (animation / format preserved)', async () => {
+      const gif = Buffer.from('GIF89a-animated-bytes');
+      storage.putObject('anim.gif', gif);
+      const res = await content('anim.gif');
+      assert.equal(res.headers.get('content-type'), 'image/gif');
+      assert.deepEqual(Buffer.from(await res.arrayBuffer()), gif);
+    });
+  });
+
+  describe('size bound (maxUploadBytes)', () => {
+    let small;
+    let smallUrl;
+    before(async () => {
+      small = createApp({ storage: new Proxy({}, { get: (_, method) => (...args) => storage[method](...args) }), maxUploadBytes: 2000 }).listen(0, '127.0.0.1');
+      await new Promise((resolve) => small.once('listening', resolve));
+      smallUrl = `http://127.0.0.1:${small.address().port}`;
+    });
+    after(() => small.close());
+
+    for (const [driver, make] of Object.entries(drivers)) {
+      it(`${driver}: a JPEG over MAX_UPLOAD_MB is refused with 413 PREVIEW_TOO_LARGE, one of exactly that size is converted`, async () => {
+        const exact = await sharp({ create: { width: 64, height: 48, channels: 3, background: '#c86432' } }).jpeg().toBuffer();
+        const padded = (size) => Buffer.concat([exact, Buffer.alloc(size - exact.length)]); // trailing bytes after EOI are ignored
+        assert.ok(exact.length < 2000);
+        ({ storage } = make({ 'exact.jpg': padded(2000), 'over.jpg': padded(2001) }));
+        const ok = await fetch(`${smallUrl}/api/files/preview/content?key=exact.jpg`);
+        assert.equal(ok.status, 200);
+        const over = await fetch(`${smallUrl}/api/files/preview/content?key=over.jpg`);
+        assert.equal(over.status, 413);
+        assert.deepEqual(await over.json(), {
+          error: { code: 'PREVIEW_TOO_LARGE', message: 'This image is too large to preview. Download it to open it in another app.' },
+        });
+      });
     }
   });
 });

@@ -451,7 +451,6 @@ async function openPreview(file) {
     const data = await api('GET', `/api/files/preview?key=${encodeURIComponent(file.key)}`, undefined, controller.signal);
     if (seq !== previewSeq) return;
     renderPreview(file, data, () => seq === previewSeq);
-    els.preview.dataset.state = 'ready';
   } catch (err) {
     if (seq !== previewSeq || err.name === 'AbortError') return;
     // Shown in the dialog only: the folder's status line is not the preview's to change.
@@ -462,17 +461,27 @@ async function openPreview(file) {
 
 // `data` is the API's { kind, text?, truncated?, url? }. Image and PDF URLs come from the server (same
 // origin, or a short-lived presigned S3 URL) and are only ever used as src/href. `isCurrent()` guards
-// events that arrive later (an image failing to decode).
+// events that arrive later (an image loading or failing to decode). A JPEG is converted by the server when
+// the <img> asks for it, which can take a moment, so an image stays "loading" until it has arrived.
 function renderPreview(file, data, isCurrent) {
   setPreviewMessage('');
+  els.preview.dataset.state = data.kind === 'image' ? 'loading' : 'ready';
   if (data.kind === 'text') {
     if (data.truncated) setPreviewMessage(TRUNCATED_NOTICE);
     els.previewBody.append(el('pre', 'preview-text', data.text));
   } else if (data.kind === 'image') {
     const img = el('img');
     img.alt = file.name;
+    setPreviewMessage('Loading preview…');
+    img.addEventListener('load', () => {
+      if (!isCurrent()) return;
+      setPreviewMessage('');
+      els.preview.dataset.state = 'ready';
+    });
     img.addEventListener('error', () => {
-      if (isCurrent()) setPreviewMessage('This image could not be displayed. Download it to open it in another app.', true);
+      if (!isCurrent()) return;
+      setPreviewMessage('This image could not be displayed. Download it to open it in another app.', true);
+      els.preview.dataset.state = 'error';
     });
     img.src = data.url;
     els.previewBody.append(img);

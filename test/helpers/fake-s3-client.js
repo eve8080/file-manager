@@ -12,13 +12,15 @@ import {
   AbortMultipartUploadCommand,
   S3Client,
 } from '@aws-sdk/client-s3';
+import { Readable } from 'node:stream';
 
 // Minimal in-process stand-in for S3Client, implementing just the commands the S3 driver uses,
 // with S3's semantics where the driver depends on them:
 // - listing: sorted keys, Prefix, Delimiter/CommonPrefixes, MaxKeys pagination (`pageSize` forces small pages)
 // - HeadObject / CopyObject / GetObject on a missing key: 404 `NotFound` / `NoSuchKey` / `NoSuchKey`
 // - GetObject `Range: bytes=a-b` (b clamped to the end; a range on an empty object is 416 `InvalidRange`);
-//   the Body offers the SDK's `transformToByteArray()`
+//   the Body is a Readable (like the SDK's on Node) that also offers `transformToByteArray()`; the last one
+//   handed out is kept in `lastBody`, so tests can see whether the driver read or destroyed it
 // - PutObject / CompleteMultipartUpload with `IfNoneMatch: '*'` on an existing key: 412 `PreconditionFailed`
 // - multipart uploads: every part except the last must be at least `minPartSize` bytes (S3: 5 MiB), else
 //   CompleteMultipartUpload fails with `EntityTooSmall`; an unknown UploadId gives `NoSuchUpload`
@@ -148,11 +150,13 @@ export class FakeS3Client {
       body = body.subarray(start, end + 1);
     }
     const bytes = Buffer.from(body);
-    return {
-      ContentLength: bytes.length,
-      ContentRange: contentRange,
-      Body: { transformToByteArray: async () => new Uint8Array(bytes) },
-    };
+    // Delivered in 64 KiB chunks, like a network stream, so a reader can stop part way.
+    const chunks = [];
+    for (let at = 0; at < bytes.length; at += 65536) chunks.push(bytes.subarray(at, at + 65536));
+    this.lastBody = Object.assign(Readable.from(chunks, { objectMode: false }), {
+      transformToByteArray: async () => new Uint8Array(bytes),
+    });
+    return { ContentLength: bytes.length, ContentRange: contentRange, Body: this.lastBody };
   }
 
   #precondition({ IfNoneMatch, Key }) {

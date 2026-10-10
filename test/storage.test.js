@@ -278,9 +278,53 @@ for (const [name, make] of Object.entries(drivers)) {
 
     it('preview: a missing file, or a folder name, is NOT_FOUND (whatever its kind)', async () => {
       const storage = make(SAMPLE);
-      for (const key of ['a/missing.txt', 'a/missing.png', 'a/missing.pdf', 'a/missing.zip', 'empty', 'a/sub']) {
+      for (const key of ['a/missing.txt', 'a/missing.png', 'a/missing.pdf', 'a/missing.zip', 'a/missing.jpg', 'a/missing.JPEG', 'empty', 'a/sub']) {
         await assert.rejects(storage.getPreview(key), { status: 404, code: 'NOT_FOUND' }, key);
       }
+    });
+
+    // ---- M4: JPEG previews are normalised by the app, so the storage hands out neither a URL nor bytes ----
+
+    it('preview jpeg: only { kind, contentType } - no presigned URL and no bytes (the app serves a converted copy)', async () => {
+      const storage = make({ 'p/IMG_0001.jpg': 'jpeg-bytes', 'p/B.JPEG': 'x', 'p/c.png': 'png' });
+      for (const key of ['p/IMG_0001.jpg', 'p/B.JPEG']) {
+        assert.deepEqual(await storage.getPreview(key), { kind: 'image', contentType: 'image/jpeg' }, key);
+      }
+      const png = await storage.getPreview('p/c.png');
+      assert.ok(png.url !== undefined || png.body !== undefined, 'other images still get a presigned URL / their bytes');
+    });
+
+    it('readPreviewSource: the exact bytes of the stored file (all byte values), or an empty buffer', async () => {
+      const all = Buffer.from(Array.from({ length: 256 }, (_, i) => i));
+      const big = Buffer.alloc(200_000, 7); // several stream chunks
+      const storage = make({ 'p/all.jpg': all, 'p/big.jpg': big, 'p/empty.jpg': '' });
+      const limit = 1_000_000;
+      assert.deepEqual(await storage.readPreviewSource('p/all.jpg', limit), all);
+      assert.deepEqual(await storage.readPreviewSource('p/big.jpg', limit), big);
+      const empty = await storage.readPreviewSource('p/empty.jpg', limit);
+      assert.ok(Buffer.isBuffer(empty));
+      assert.equal(empty.length, 0);
+    });
+
+    it('readPreviewSource: a file of exactly the limit is read; one byte more is PREVIEW_TOO_LARGE (413)', async () => {
+      const storage = make({ 'p/exact.jpg': Buffer.alloc(1000, 1), 'p/over.jpg': Buffer.alloc(1001, 1) });
+      assert.equal((await storage.readPreviewSource('p/exact.jpg', 1000)).length, 1000);
+      await assert.rejects(storage.readPreviewSource('p/over.jpg', 1000), { status: 413, code: 'PREVIEW_TOO_LARGE' });
+    });
+
+    it('readPreviewSource: a missing file, or a folder name, is NOT_FOUND', async () => {
+      const storage = make(SAMPLE);
+      for (const key of ['a/missing.jpg', 'empty', 'a/sub']) {
+        await assert.rejects(storage.readPreviewSource(key, 1000), { status: 404, code: 'NOT_FOUND' }, key);
+      }
+    });
+
+    it('readPreviewSource never changes the stored file or the listing', async () => {
+      const storage = make({ 'p/x.jpg': 'original' });
+      const before = await storage.list('p/');
+      await storage.readPreviewSource('p/x.jpg', 100);
+      await storage.getPreview('p/x.jpg');
+      assert.deepEqual(await storage.list('p/'), before);
     });
   });
 }
@@ -574,6 +618,57 @@ describe('s3 driver specifics', () => {
     await assert.rejects(storage.getPreview('a.txt'), { name: 'NoSuchBucket' });
     client.failNext('GetObjectCommand', { name: 'SlowDown', status: 503 });
     await assert.rejects(storage.getPreview('a.txt'), { name: 'SlowDown' });
+  });
+
+  // ---- M4: normalised JPEG previews on S3 ----
+
+  it('preview jpeg: costs one HEAD only - no GET of the photo and no presigning', async () => {
+    const client = new FakeS3Client({ 'IMG_0001.jpg': 'jpeg-bytes' });
+    const storage = createS3Storage({ bucket: 'b', client }); // no signing client: any presign attempt would fail loudly
+    assert.deepEqual(await storage.getPreview('IMG_0001.jpg'), { kind: 'image', contentType: 'image/jpeg' });
+    assert.deepEqual(client.calls, ['HeadObjectCommand']);
+  });
+
+  it('readPreviewSource: exactly one unranged GET, nothing written, and the whole body read', async () => {
+    const photo = Buffer.alloc(150_000, 9);
+    const client = new FakeS3Client({ 'p/IMG_0001.jpg': photo });
+    const storage = createS3Storage({ bucket: 'b', client });
+    assert.deepEqual(await storage.readPreviewSource('p/IMG_0001.jpg', 1_000_000), photo);
+    assert.deepEqual(client.calls, ['GetObjectCommand']);
+    assert.deepEqual(client.inputs[0].input, { Bucket: 'b', Key: 'p/IMG_0001.jpg' }, 'no Range, no overrides');
+    assert.deepEqual(client.objects.get('p/IMG_0001.jpg').body, photo, 'the stored original is untouched');
+  });
+
+  it('readPreviewSource: a file over the limit is refused from the GET headers - its body is destroyed unread', async () => {
+    const client = new FakeS3Client({ 'big.jpg': Buffer.alloc(300_000, 1) });
+    const storage = createS3Storage({ bucket: 'b', client });
+    await assert.rejects(storage.readPreviewSource('big.jpg', 299_999), { status: 413, code: 'PREVIEW_TOO_LARGE' });
+    assert.equal(client.lastBody.destroyed, true);
+    assert.equal(client.lastBody.readableDidRead, false, 'not a byte was read');
+    assert.deepEqual(client.calls, ['GetObjectCommand']);
+  });
+
+  it('readPreviewSource: a body longer than its declared length still stops at the limit (never buffers past it)', async () => {
+    class LyingClient extends FakeS3Client {
+      async send(command) {
+        const result = await super.send(command);
+        return result.Body ? { ...result, ContentLength: 10 } : result;
+      }
+    }
+    const client = new LyingClient({ 'liar.jpg': Buffer.alloc(300_000, 1) });
+    const storage = createS3Storage({ bucket: 'b', client });
+    await assert.rejects(storage.readPreviewSource('liar.jpg', 100_000), { status: 413, code: 'PREVIEW_TOO_LARGE' });
+    assert.equal(client.lastBody.destroyed, true);
+  });
+
+  it('readPreviewSource: NoSuchKey is NOT_FOUND; other S3 failures reach the caller as the SDK error', async () => {
+    const client = new FakeS3Client({ 'a.jpg': 'A' });
+    const storage = createS3Storage({ bucket: 'b', client });
+    await assert.rejects(storage.readPreviewSource('missing.jpg', 100), { status: 404, code: 'NOT_FOUND' });
+    client.failNext('GetObjectCommand', { name: 'AccessDenied', status: 403 });
+    await assert.rejects(storage.readPreviewSource('a.jpg', 100), { name: 'AccessDenied' });
+    client.failNext('GetObjectCommand', { name: 'NoSuchBucket', status: 404 });
+    await assert.rejects(storage.readPreviewSource('a.jpg', 100), { name: 'NoSuchBucket' });
   });
 
   // ---- M2: move is copy-then-delete on S3 ----

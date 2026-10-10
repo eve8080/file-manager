@@ -3,8 +3,9 @@ import { fileURLToPath } from 'node:url';
 import express from 'express';
 import { attachmentDisposition, inlineDisposition } from './disposition.js';
 import { badRequest, toPublicError } from './errors.js';
+import { MAX_CONCURRENT_CONVERSIONS, createLimiter, normalizeJpeg } from './jpeg-preview.js';
 import { folderName, parseFileKey, parseFolderPath, parsePrefix } from './paths.js';
-import { previewKind } from './preview.js';
+import { needsNormalizing, previewKind } from './preview.js';
 import { receiveUploads } from './upload.js';
 
 const PUBLIC_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'public');
@@ -14,7 +15,8 @@ const DEFAULT_MAX_UPLOAD_BYTES = 100 * 1024 * 1024;
 const UPLOAD_FRAMING_BYTES = 64 * 1024;
 
 // `maxUploadBytes` limits each uploaded file and, plus UPLOAD_FRAMING_BYTES, each upload request
-// (MAX_UPLOAD_MB from the config, default 100 MB).
+// (MAX_UPLOAD_MB from the config, default 100 MB). It also limits the size of a JPEG that is converted
+// for preview (decision D25).
 export function createApp({ storage, maxUploadBytes = DEFAULT_MAX_UPLOAD_BYTES }) {
   const app = express();
   app.disable('x-powered-by');
@@ -24,6 +26,7 @@ export function createApp({ storage, maxUploadBytes = DEFAULT_MAX_UPLOAD_BYTES }
 
   const api = express.Router();
   api.use(sameOriginWrites);
+  const jpegConversions = createLimiter(MAX_CONCURRENT_CONVERSIONS);
 
   api.get('/health', (req, res) => {
     res.json({ ok: true });
@@ -93,13 +96,23 @@ export function createApp({ storage, maxUploadBytes = DEFAULT_MAX_UPLOAD_BYTES }
 
   // An image/PDF preview's bytes, inline, typed by extension (with nosniff, never as HTML). Memory/demo
   // serves them; S3 redirects to its presigned URL. Its own CSP lets only this app frame it (PDF viewer).
+  // JPEGs (decision D25) are the exception: on both drivers the app reads the stored file and serves a
+  // converted copy (src/jpeg-preview.js) - nothing is redirected, and nothing is written back.
   api.get('/files/preview/content', async (req, res) => {
     const key = parseFileKey(queryParam(req, 'key'));
     if (!['image', 'pdf'].includes(previewKind(key).kind)) throw badRequest('Only images and PDFs have preview content');
-    const { contentType, url, body } = await storage.getPreview(key);
-    res.set('Cache-Control', 'no-store');
-    if (url) return res.redirect(302, url);
+    let contentType;
+    let body;
+    if (needsNormalizing(key)) {
+      contentType = 'image/jpeg';
+      body = await jpegConversions.run(async () => normalizeJpeg(await storage.readPreviewSource(key, maxUploadBytes)));
+    } else {
+      const preview = await storage.getPreview(key);
+      if (preview.url) return res.set('Cache-Control', 'no-store').redirect(302, preview.url);
+      ({ contentType, body } = preview);
+    }
     res.set({
+      'Cache-Control': 'no-store',
       'Content-Type': contentType,
       'Content-Disposition': inlineDisposition(key.split('/').pop()),
       'Content-Security-Policy': "default-src 'none'; frame-ancestors 'self'",

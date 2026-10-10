@@ -94,6 +94,12 @@ export function toPublicError(err) {
   return { status: 500, code: 'INTERNAL_ERROR', message: 'Internal server error' };
 }
 
+// JPEG previews are converted by the app (src/jpeg-preview.js). Fixed messages: no decoder or S3 detail reaches a client.
+export const previewFailed = () =>
+  new AppError(422, 'PREVIEW_FAILED', 'This image could not be converted for preview. Download it to open it in another app.');
+export const previewTooLarge = () =>
+  new AppError(413, 'PREVIEW_TOO_LARGE', 'This image is too large to preview. Download it to open it in another app.');
+
 // A move (copy-then-delete) whose copy succeeded but whose source could not be deleted, so the file
 // now exists under both names. details: { from, to, copied: true, sourceDeleted: false, reason }
 export const moveIncomplete = (details) =>

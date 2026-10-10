@@ -1,6 +1,6 @@
-import { conflict, folderNameConflict, notFound, pathNameConflict } from '../errors.js';
+import { conflict, folderNameConflict, notFound, pathNameConflict, previewTooLarge } from '../errors.js';
 import { ancestorPaths } from '../paths.js';
-import { previewKind, textPreview } from '../preview.js';
+import { needsNormalizing, previewKind, textPreview } from '../preview.js';
 
 // In-memory storage with the same behaviour as the S3 driver. Used by tests and `npm run demo`.
 //
@@ -20,6 +20,11 @@ import { previewKind, textPreview } from '../preview.js';
 //                                        { kind: 'image'|'pdf', contentType, url } (S3: presigned inline GET,
 //                                        5 minutes) or { kind, contentType, body } (memory)
 //                                        { kind: 'none' } (download only)
+//                                        JPEGs (needsNormalizing) are { kind: 'image', contentType } only: the app
+//                                        serves a converted copy from readPreviewSource, so there is no URL or body
+//   readPreviewSource(key, maxBytes) -> Buffer, the whole stored file (S3: one GET, nothing else); throws
+//                                        NOT_FOUND / PREVIEW_TOO_LARGE (413) if it is longer than maxBytes -
+//                                        checked before the body is read, and again while reading
 //   moveFile(from, to)               -> renames/moves one file; throws NOT_FOUND (from) / FILE_EXISTS (to) /
 //                                        NAME_CONFLICT (`to` is a folder's name, or part of its path is a file);
 //                                        S3 only: MOVE_INCOMPLETE if the copy exists but the source remains
@@ -115,8 +120,15 @@ export function createMemoryStorage(initial = {}) {
       const preview = previewKind(key);
       const { body } = objects.get(key);
       if (preview.kind === 'text') return textPreview(body, body.length);
-      if (preview.kind === 'none') return preview;
+      if (preview.kind === 'none' || needsNormalizing(key)) return preview;
       return { ...preview, body: Buffer.from(body) };
+    },
+
+    async readPreviewSource(key, maxBytes) {
+      if (!objects.has(key)) throw notFound('File not found');
+      const { body } = objects.get(key);
+      if (body.length > maxBytes) throw previewTooLarge();
+      return Buffer.from(body);
     },
 
     async moveFile(from, to) {

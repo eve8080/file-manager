@@ -1,6 +1,6 @@
 # Implementation Brief — S3 File Manager
 
-Status: direction approved by Mr. So on 2026-10-08.
+Status: direction approved by Mr. So on 2026-10-08. JPEG preview conversion (D25) approved and implemented 2026-10-10; the exact private image passed on physical-iPhone Safari through the demo driver, while the real-S3 physical retest remains open.
 
 ## 1. Requirements
 - Web application usable from desktop and mobile browsers.
@@ -38,6 +38,7 @@ Status: direction approved by Mr. So on 2026-10-08.
 | D22 | Upload request limit (review follow-up, 2026-10-09): `MAX_UPLOAD_MB` limits each file **and** each upload request, whose body may be at most `MAX_UPLOAD_MB` + 64 KiB of multipart framing (so one file of exactly the limit always fits). A declared `Content-Length` over it → 413 `REQUEST_TOO_LARGE` before anything is read or stored. A chunked body is counted as it streams; at the limit, parsing stops, the file in flight fails with `REQUEST_TOO_LARGE` (its S3 multipart upload aborted), files before it are stored and reported, and the rest of the body is not read (`Connection: close`). No new configuration. |
 | D23 | File/folder name collisions (review follow-up, 2026-10-09): an upload or move may not give a file the visible name of an existing folder, nor put it under a path whose part is an existing file. Both → 409 `NAME_CONFLICT`, with the fixed messages "A folder with that name already exists" / "Part of that path is a file, not a folder". An existing file at the destination is still 409 `FILE_EXISTS` (checked first). The check is not atomic with the S3 write. Creating a folder where a file of that name exists is unchanged (M1). |
 | D24 | M3 preview (approved by Mr. So on 2026-10-09): the kind comes from the file extension only (`src/preview.js`): text (`txt`, `md`, `csv`, `json`, `html`, `svg`, … shown strictly as text via `textContent`), image (`jpg`/`jpeg`/`png`/`gif`/`webp`), PDF; anything else is `none` (download only). Text previews send at most the first 1 MiB (1,048,576 bytes; S3: one ranged GET), with `truncated: true` and a visible notice when the file is larger; a UTF-8 character cut by the limit is dropped. Image/PDF previews from real S3 are 5-minute presigned GET URLs that override `Content-Type` (from the extension, never the stored type) and `Content-Disposition: inline`. Memory/demo instead returns a same-origin URL, `GET /api/files/preview/content?key=` (bytes inline, typed by extension, `nosniff`, its own CSP `default-src 'none'; frame-ancestors 'self'` so the PDF can be framed; on S3 the same route 302s to the presigned URL). The page CSP adds `img-src`/`frame-src 'self' https://*.amazonaws.com`; scripts stay same-origin. No new dependency. |
+| D25 | JPEG previews are converted on demand (M4 follow-up, approved by Mr. So, recorded 2026-10-10). **Finding:** on a physical iPhone, `IMG_0001.jpeg` (baseline JPEG, 5712×4284, Display P3, MPF + XMP HDR gain map) did not show in the preview `<img>` although the response was a valid `200 image/jpeg` that desktop Chrome decodes; an ordinary JPEG worked. Differential fixtures on the phone: the original 5712 px/P3 failed; the same picture resized to 4032 px or 2048 px (P3) worked; a full-size 5712 px re-encode worked in sRGB and in P3. So the cause is the original's MPF/gain-map encoding and metadata, not its size or P3 alone. **Decision:** `sharp` (the only new direct dependency) converts every `.jpg`/`.jpeg` preview: rotated by its EXIF orientation, fitted inside 2048×2048 without enlargement, converted to sRGB, re-encoded as a baseline JPEG (quality 85) with all metadata, the colour profile, the gain map and the MPF second image dropped (`src/jpeg-preview.js`). The original is never changed and no derivative is stored (S3 is read only); there are no temp files. **API:** for JPEGs `GET /api/files/preview` returns `{ kind: 'image', url: '/api/files/preview/content?key=…' }` on every driver (never a presigned URL; S3 does one `HeadObject`), and `GET /api/files/preview/content` reads the file (S3: one `GetObject`, only now), converts it and answers 200 `image/jpeg` with `Content-Disposition: inline`, `X-Content-Type-Options: nosniff`, `Cache-Control: no-store` and the content route's CSP `default-src 'none'; frame-ancestors 'self'`. PNG, GIF, WebP and PDF are unchanged (presigned on S3, so animation and format are untouched); downloads are unchanged. **Storage:** `getPreview` for a JPEG returns only `{ kind, contentType }`; the new `readPreviewSource(key, maxBytes)` returns the whole file as a Buffer. **Bounds:** the source is limited to `MAX_UPLOAD_MB` (no new setting; default 100 MB): S3 refuses from the GET's `ContentLength` before reading a byte and also stops a longer-than-declared stream; over the limit → 413 `PREVIEW_TOO_LARGE`. sharp needs the whole file in memory, so at most 2 conversions run at once (`MAX_CONCURRENT_CONVERSIONS`; the others wait without holding data), giving a peak of roughly 2 × `MAX_UPLOAD_MB` plus decoder working memory. Input is accepted only if it starts with a JPEG signature (an SVG or PNG named `.jpg` is refused, not rendered), at most 128 megapixels, and a conversion is stopped after 30 s. **Errors:** a corrupt, cut-off or unsupported file → 422 `PREVIEW_FAILED` with a fixed message; the decoder's own error is only logged. The UI shows its usual "could not be displayed" message with Download kept. **UI:** an image preview stays "Loading preview…" (state `loading`) until the picture has arrived, because the conversion takes a moment. |
 
 ## 3. Architecture
 ```
@@ -46,14 +47,16 @@ AI agent ────────────────┴─ HTTP JSON API �
                                                                                     └─ memory (tests/demo)
 ```
 - Stack: Node.js >= 22.9, Express 5, `@aws-sdk/client-s3`, `@aws-sdk/s3-request-presigner` and `busboy`
-  (both approved for M2, 2026-10-09), vanilla HTML/CSS/JS frontend, `node:test`.
+  (both approved for M2, 2026-10-09), `sharp` (approved for JPEG previews, D25), vanilla HTML/CSS/JS frontend,
+  `node:test`.
 - Config (`.env`): `S3_BUCKET`, `AWS_REGION`, optional `AWS_PROFILE`, `HOST`, `PORT`, `MAX_UPLOAD_MB`.
-- Downloads / image and PDF previews (M2/M3): 5-minute presigned GET URLs. Text preview capped at 1 MiB, rendered as text (D24).
+- Downloads / PNG, GIF, WebP and PDF previews (M2/M3): 5-minute presigned GET URLs. Text preview capped at 1 MiB,
+  rendered as text (D24). JPEG previews are converted by the app and served from `/api/files/preview/content` (D25).
 - Path rules (`src/paths.js`): no leading `/`, no empty / `.` / `..` segments, no control characters,
   no leading/trailing whitespace in a segment, max 1024 bytes.
 
 ## 4. API
-Errors: `{ "error": { "code": "...", "message": "...", "details"?: {...} } }` with 400 / 403 / 404 / 409 / 413 / 502 / 500.
+Errors: `{ "error": { "code": "...", "message": "...", "details"?: {...} } }` with 400 / 403 / 404 / 409 / 413 / 422 / 502 / 500.
 
 | Method | Path | Milestone | Result |
 |---|---|---|---|
@@ -65,8 +68,8 @@ Errors: `{ "error": { "code": "...", "message": "...", "details"?: {...} } }` wi
 | GET | `/api/files/download?key=` | M2 | 302 to presigned URL |
 | POST | `/api/files/move` `{ from, to }` | M2 | rename/move file |
 | DELETE | `/api/files?key=` | M2 | delete file |
-| GET | `/api/files/preview?key=` | M3 | `{ kind: text|image|pdf|none, text?, truncated?, url? }` |
-| GET | `/api/files/preview/content?key=` | M3 | image/PDF bytes inline (memory/demo); 302 to the presigned URL (S3); 400 for other kinds (D24) |
+| GET | `/api/files/preview?key=` | M3 | `{ kind: text|image|pdf|none, text?, truncated?, url? }`; a JPEG's `url` is always the same-origin content route (D25) |
+| GET | `/api/files/preview/content?key=` | M3 | PNG/GIF/WebP/PDF bytes inline (memory/demo); 302 to the presigned URL (S3); 400 for other kinds (D24). `.jpg`/`.jpeg`: a converted 200 `image/jpeg` on every driver; 413 `PREVIEW_TOO_LARGE`, 422 `PREVIEW_FAILED` (D25) |
 
 ## 5. Milestones and acceptance criteria
 **M0 – Skeleton** (delivered together with M1)
@@ -116,6 +119,17 @@ Errors: `{ "error": { "code": "...", "message": "...", "details"?: {...} } }` wi
 
 **M4 – Manual real-S3 check (Mr. So)**
 - Checklist run against the real bucket from desktop and phone on Wi-Fi
+
+**M4 follow-up – JPEG previews on iPhone (D25)**, each with an automated test (`test/jpeg-preview.test.js`, `test/storage.test.js`, `test/api.test.js`, `test/browser.test.js`):
+- `.jpg`/`.jpeg` previews (any case) use a same-origin content URL on memory/demo and S3; no presigned JPEG URL is ever exposed
+- The converted JPEG is `image/jpeg`, at most 2048 px on its longer side, never enlarged, rotated by its EXIF orientation, in sRGB (a Display P3 pixel keeps its colour), with no EXIF/XMP/MPF/ICC/COM segment, no gain map and no second image, baseline, and ends at a single EOI
+- Headers: inline disposition, `nosniff`, `Cache-Control: no-store`, CSP `default-src 'none'; frame-ancestors 'self'`
+- S3: the preview JSON costs one `HeadObject`; the photo is read by exactly one unranged `GetObject` and only when the content is requested; nothing is written, copied or deleted; the original stays byte for byte and downloads as before
+- Bounds: a source of exactly `MAX_UPLOAD_MB` converts, one byte more → 413 `PREVIEW_TOO_LARGE` (refused from the headers before any byte is read; a stream longer than declared is cut off at the limit); at most 2 conversions at once; a non-JPEG signature and a picture over the pixel limit (128 MP; the tests lower it) fail. The 30 s conversion timeout is set in code but not exercised by a test
+- Corrupt, cut-off, wrong-format or oversized files → fixed 422 `PREVIEW_FAILED` / 413 `PREVIEW_TOO_LARGE`; no sharp/libvips/AWS text reaches a client; the server keeps serving; the UI shows the error in the dialog with Download kept and the folder status untouched
+- PNG, GIF, WebP and PDF behave exactly as before (S3: presigned URLs; memory: stored bytes); the 1 MiB text cap and the page/content security headers are unchanged
+- Phone width (375 px): the converted picture is shown (natural size 1365×2048 for the 3000×2000 rotated test photo, fits the viewport, no horizontal scrolling); the image stays "Loading preview…" until it arrives
+- **Manual acceptance:** the exact private gain-map `IMG_0001.jpeg` passed on physical-iPhone Safari through the demo driver on 2026-10-10. The same test with real S3 remains open and requires separate AWS authorization (the automated fixtures are synthetic and test Chrome is not Safari)
 
 ## 6. Out of scope (v1)
 Authentication; internet hosting/deployment; folder rename; search; share links; trash/undo beyond S3

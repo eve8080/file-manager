@@ -22,15 +22,33 @@ import {
   moveIncomplete,
   notFound,
   pathNameConflict,
+  previewTooLarge,
   storageReason,
 } from '../errors.js';
 import { ancestorPaths } from '../paths.js';
-import { PREVIEW_TEXT_BYTES, previewKind, textPreview } from '../preview.js';
+import { PREVIEW_TEXT_BYTES, needsNormalizing, previewKind, textPreview } from '../preview.js';
 
 const DELETE_BATCH_SIZE = 1000; // S3 DeleteObjects limit
 const MAX_REPORTED_FAILURES = 20;
 const PRESIGNED_URL_SECONDS = 5 * 60; // downloads and image/PDF previews
 const UPLOAD_PART_BYTES = 8 * 1024 * 1024; // S3 requires at least 5 MiB for every part but the last
+
+// The whole body of a GET as one Buffer, never more than `maxBytes`: refused from the declared length before
+// reading anything, and cut off if the stream turns out longer (the stream is destroyed either way).
+async function readCapped(body, declaredLength, maxBytes) {
+  if (declaredLength > maxBytes) {
+    body?.destroy?.();
+    throw previewTooLarge();
+  }
+  const chunks = [];
+  let total = 0;
+  for await (const chunk of body ?? []) {
+    total += chunk.length;
+    if (total > maxBytes) throw previewTooLarge(); // leaving the loop destroys the stream
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks);
+}
 
 // S3 storage driver. See src/storage/memory.js for the interface.
 // `client` can be injected for tests; by default the SDK resolves credentials itself. `signingClient`
@@ -310,7 +328,7 @@ export function createS3Storage({
       const head = await headObject(key);
       if (head === undefined) throw notFound('File not found');
       const preview = previewKind(key);
-      if (preview.kind === 'none') return preview;
+      if (preview.kind === 'none' || needsNormalizing(key)) return preview; // JPEG: the app converts it, see below
       if (preview.kind !== 'text') {
         const url = await presignGet(key, {
           ResponseContentType: preview.contentType,
@@ -330,6 +348,19 @@ export function createS3Storage({
         throw err;
       }
       return textPreview(await object.Body.transformToByteArray(), size);
+    },
+
+    // The whole file for the JPEG converter: one GetObject (its headers say whether it fits, so an oversized
+    // photo is refused before any of it is read) and nothing else; the stored object is never written.
+    async readPreviewSource(key, maxBytes) {
+      let object;
+      try {
+        object = await client.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
+      } catch (err) {
+        if (err?.name === 'NoSuchKey') throw notFound('File not found');
+        throw err;
+      }
+      return readCapped(object.Body, object.ContentLength, maxBytes);
     },
 
     // S3 has no rename: copy, then delete the source. The source is deleted only after the copy succeeded.

@@ -6,7 +6,7 @@ A small personal web file manager for one private AWS S3 bucket, usable from a d
 > Run it only on your own machine or a trusted Wi-Fi. Never expose it to the internet.
 
 Status: Milestone 3 (folders; upload, download, rename/move and delete of files; preview of text, images and
-PDFs). See `IMPLEMENTATION_BRIEF.md`.
+PDFs) plus the M4 follow-up that converts JPEG previews for iPhone Safari (D25). See `IMPLEMENTATION_BRIEF.md`.
 
 ## Prerequisites
 - Node.js 22.9 or newer
@@ -42,6 +42,9 @@ npm install
 cp .env.example .env
 # edit .env: S3_BUCKET, AWS_REGION, and optionally AWS_PROFILE
 ```
+`npm install` also installs [`sharp`](https://sharp.pixelplumbing.com/) (JPEG previews). It ships prebuilt native
+libraries for the platform (macOS, Linux and Windows on common CPUs), so no compiler or system libvips is needed;
+on a platform without a prebuilt package `npm install` fails or the JPEG preview reports an error.
 
 ## Run
 If port 3000 is taken by another program, startup stops with `Could not start server: … is already in use
@@ -81,15 +84,34 @@ Errors are returned as `{ "error": { "code": "...", "message": "...", "details"?
 | POST | `/api/files/move` with JSON `{ "from": "Documents/a.pdf", "to": "Archive/a.pdf" }` | rename/move; 404 if `from` is missing, 409 `FILE_EXISTS` if `to` exists, 409 `NAME_CONFLICT` if `to` is a folder's name or goes through a file. On S3 this is copy-then-delete: if the copy worked but the original could not be removed, **502 `MOVE_INCOMPLETE`** with `details: { from, to, copied, sourceDeleted, reason }` (the file then exists under both names) |
 | DELETE | `/api/files?key=Documents/a.pdf` | deletes one file; 404 if missing |
 | GET | `/api/files/preview?key=Documents/a.pdf` | `{ kind: "text", text, truncated }`, `{ kind: "image" \| "pdf", url }` or `{ kind: "none" }` (see below); 404 if missing |
-| GET | `/api/files/preview/content?key=Photos/a.png` | the image/PDF shown inline. Demo: the bytes; real S3: 302 to the presigned URL. 400 for other types |
+| GET | `/api/files/preview/content?key=Photos/a.png` | the image/PDF shown inline. Demo: the bytes; real S3: 302 to the presigned URL. 400 for other types. **`.jpg`/`.jpeg` (both modes): a converted copy, 200 `image/jpeg`** (see below); 413 `PREVIEW_TOO_LARGE`, 422 `PREVIEW_FAILED` |
 
 **Preview.** The type comes from the file extension: text (`txt`, `md`, `csv`, `tsv`, `log`, `json`, `xml`, `yaml`,
 `html`, `css`, `js`, `svg`, …), images (`jpg`, `jpeg`, `png`, `gif`, `webp`) and PDF. Everything else is
 `none`: the UI offers Download only. Text previews contain at most the first 1 MiB of the file; a larger file
 has `truncated: true` and the UI says so. Text, including HTML, is always shown as plain characters, never
-rendered or run. On real S3, `url` is a presigned link valid for 5 minutes that serves the file inline with the
-type of its extension; in the demo it is a local `/api/files/preview/content` link. The page's Content
+rendered or run. On real S3, `url` (except for JPEGs, below) is a presigned link valid for 5 minutes that serves
+the file inline with the type of its extension; in the demo it is a local `/api/files/preview/content` link. The page's Content
 Security Policy allows images and frames from `https://*.amazonaws.com` for this (scripts stay same-origin).
+**JPEG previews are converted.** An iPhone photo can carry an HDR gain map (MPF/XMP data) that some versions of
+iPhone Safari refuse to show, even though the file is valid and desktop browsers display it. So for `.jpg` and
+`.jpeg` the preview JSON's `url` is always this app's own `/api/files/preview/content?key=…` (never a presigned
+link), and that route reads the file and answers a freshly made 200 `image/jpeg` (inline, `nosniff`,
+`Cache-Control: no-store`): rotated by its EXIF orientation, at most 2048 px on its longer side (smaller pictures
+are not enlarged), converted to sRGB, with all metadata, the colour profile, the gain map and the extra embedded
+image removed. The stored file is never changed, nothing is written back to S3 and no temp file is used; downloads
+still deliver the original, byte for byte. PNG, GIF, WebP and PDF previews are not touched (so animated GIFs keep
+animating). A file that is not a decodable JPEG (corrupt, cut off, another format named `.jpg`, over 128 megapixels)
+gets 422 `PREVIEW_FAILED` with a fixed message, never a decoder message; the UI shows "This image could not be
+displayed" and keeps Download.
+
+*Resources.* Converting needs the whole file in memory, so the JPEG source is limited to `MAX_UPLOAD_MB` (default
+100 MB; no new setting): a larger file gets 413 `PREVIEW_TOO_LARGE` (on S3 decided from the response headers,
+before any of it is read) and can still be downloaded. At most 2 conversions run at once, others wait; expect a
+peak around 2 × `MAX_UPLOAD_MB` plus decoder memory when two huge photos are previewed together. Opening a preview
+costs one S3 `HeadObject`; the photo itself is read (one `GetObject`) only when the picture is requested, so each
+JPEG preview re-reads and re-converts it (nothing is cached).
+
 In the UI, every file row has a Preview button; the preview opens in a dialog (full screen on a phone) with
 Download and Close, and closes when you navigate to another folder (including the Back button).
 
