@@ -1,4 +1,5 @@
 // Single-page UI. All user-controlled text is inserted with textContent, never innerHTML.
+import { auth, startAuth } from './auth.js';
 
 const els = {
   breadcrumbs: document.getElementById('breadcrumbs'),
@@ -40,10 +41,11 @@ function navigationToken() {
 async function api(method, url, body, signal) {
   const res = await fetch(url, {
     method,
-    headers: body ? { 'Content-Type': 'application/json' } : undefined,
+    headers: { ...auth.headers(), ...(body ? { 'Content-Type': 'application/json' } : {}) },
     body: body ? JSON.stringify(body) : undefined,
     signal,
   });
+  if (res.status === 401 && auth.enabled) auth.expired(); // clears the page before the caller sees the error
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
     const err = new Error(data.error?.message || `Request failed (${res.status})`);
@@ -96,6 +98,66 @@ function el(tag, className, text) {
 
 function downloadUrl(key) {
   return `/api/files/download?key=${encodeURIComponent(key)}`;
+}
+
+// Without login a Download is a plain link. With login the link would carry no token, so Download is a button
+// that fetches the file with the token (downloadFile) and the page holds no private /api link.
+function downloadControl(file) {
+  if (!auth.enabled) {
+    const link = el('a', 'button download', 'Download');
+    link.href = downloadUrl(file.key);
+    return link;
+  }
+  const button = el('button', 'download', 'Download');
+  button.type = 'button';
+  button.addEventListener('click', () => downloadFile(file));
+  return button;
+}
+
+// Object URLs of authorized downloads, revoked after a while or on sign-out.
+const downloadObjectUrls = new Set();
+const DOWNLOAD_URL_LIFETIME_MS = 60_000;
+
+// With login: fetches the download with the token. Real S3 answers { url } (a 5-minute presigned link, opened as is);
+// memory/demo answers the bytes, saved through a blob: URL. Errors go to the status line (D16 applies).
+async function downloadFile(file) {
+  const nav = navigationToken();
+  try {
+    const res = await fetch(downloadUrl(file.key), { headers: auth.headers() });
+    if (res.status === 401) auth.expired();
+    if (!res.ok) throw await responseError(res);
+    const link = el('a');
+    if (res.headers.get('Content-Type')?.startsWith('application/json')) {
+      const { url } = await res.json();
+      if (new URL(url).protocol !== 'https:') throw new Error('Unexpected download link');
+      link.href = url;
+    } else {
+      const blob = await res.blob();
+      if (!auth.signedIn) return; // the session ended meanwhile: keep no copy of the file in the page
+      const objectUrl = URL.createObjectURL(blob);
+      downloadObjectUrls.add(objectUrl);
+      setTimeout(() => revokeDownloadUrl(objectUrl), DOWNLOAD_URL_LIFETIME_MS);
+      link.href = objectUrl;
+      link.download = file.name;
+    }
+    if (!nav.stillOn() || !auth.signedIn) return;
+    link.click();
+  } catch (err) {
+    if (!nav.stillOn() || !auth.signedIn) return;
+    setStatus(`Could not download "${file.name}": ${err.message}`, true);
+  }
+}
+
+function revokeDownloadUrl(url) {
+  if (downloadObjectUrls.delete(url)) URL.revokeObjectURL(url);
+}
+
+async function responseError(res) {
+  const data = await res.json().catch(() => ({}));
+  const err = new Error(data.error?.message || `Request failed (${res.status})`);
+  err.code = data.error?.code;
+  err.status = res.status;
+  return err;
 }
 
 function formatSize(bytes) {
@@ -180,8 +242,7 @@ function renderListing() {
     preview.type = 'button';
     preview.setAttribute('aria-label', `Preview ${file.name}`);
     preview.addEventListener('click', () => openPreview(file));
-    const download = el('a', 'button download', 'Download');
-    download.href = downloadUrl(file.key);
+    const download = downloadControl(file);
     download.setAttribute('aria-label', `Download ${file.name}`);
     const rename = el('button', null, 'Rename');
     rename.type = 'button';
@@ -368,7 +429,9 @@ async function uploadFiles() {
   els.uploads.append(...items.map((i) => i.li));
 
   let uploaded = 0;
+  const session = auth.epoch;
   for (const [i, file] of files.entries()) {
+    if (auth.epoch !== session) return; // signed out: the rest is not uploaded (the list was cleared)
     const { li, progress, result } = items[i];
     result.textContent = 'Uploading…';
     const outcome = await uploadOne(prefix, file, progress);
@@ -396,19 +459,30 @@ function uploadOne(prefix, file, progress) {
     form.append('files', file, file.name);
     const xhr = new XMLHttpRequest();
     xhr.open('POST', `/api/files?prefix=${encodeURIComponent(prefix)}`);
+    for (const [name, value] of Object.entries(auth.headers())) xhr.setRequestHeader(name, value);
     xhr.responseType = 'json';
     xhr.upload.addEventListener('progress', (event) => {
       if (event.lengthComputable) progress.value = Math.floor((event.loaded / event.total) * 100);
     });
     xhr.addEventListener('load', () => {
+      activeUploads.delete(xhr);
+      if (xhr.status === 401 && auth.enabled) auth.expired();
       if (xhr.status === 201) return resolve({ ok: true });
       const error = xhr.response?.error;
       resolve({ ok: false, message: error?.details?.files?.[0]?.error?.message ?? error?.message ?? `Upload failed (${xhr.status})` });
     });
-    xhr.addEventListener('error', () => resolve({ ok: false, message: 'Upload failed: the connection was lost.' }));
+    xhr.addEventListener('error', () => {
+      activeUploads.delete(xhr);
+      resolve({ ok: false, message: 'Upload failed: the connection was lost.' });
+    });
+    xhr.addEventListener('abort', () => resolve({ ok: false, message: 'Upload stopped: signed out.' }));
+    activeUploads.add(xhr);
     xhr.send(form);
   });
 }
+
+// Uploads in flight, aborted when the session ends (with login).
+const activeUploads = new Set();
 
 // ---- Preview ----
 
@@ -424,14 +498,51 @@ function setPreviewMessage(message, isError = false) {
 // preview, closing (button or Escape) and navigating all increment this and abort the request in flight.
 let previewSeq = 0;
 let previewController = null;
+let previewFile = null; // the file whose preview is open (the dialog's Download, with login)
+// With login, same-origin preview content is fetched with the token and shown from blob: URLs; revoked on end.
+let previewObjectUrls = [];
 
 function endPreview() {
   previewSeq += 1;
   previewController?.abort();
   previewController = null;
+  previewFile = null;
   els.previewBody.replaceChildren(); // also stops a PDF or image that is still loading
+  for (const url of previewObjectUrls) URL.revokeObjectURL(url);
+  previewObjectUrls = [];
   setPreviewMessage('');
   els.preview.dataset.state = 'closed';
+}
+
+// With login the dialog's Download is a button like the rows' (see downloadControl).
+function useAuthorizedPreviewDownload() {
+  const button = el('button', 'download', 'Download');
+  button.type = 'button';
+  button.id = 'preview-download';
+  button.addEventListener('click', () => {
+    if (previewFile) downloadFile(previewFile);
+  });
+  els.previewDownload.replaceWith(button);
+  els.previewDownload = button;
+}
+
+// The token may only go to this app's own API: the URL must resolve to this origin and /api/ (a protocol-relative
+// "//host/…" also starts with "/", so a prefix check is not enough). Anything else is used as is, without the token.
+function isOwnApiUrl(url) {
+  const resolved = new URL(url, location.href);
+  return resolved.origin === location.origin && resolved.pathname.startsWith('/api/');
+}
+
+// Fetches same-origin preview content with the token; resolves to a blob: URL, or null if the preview ended meanwhile.
+async function authorizedObjectUrl(url, seq, signal) {
+  const res = await fetch(url, { headers: auth.headers(), signal });
+  if (res.status === 401) auth.expired();
+  if (!res.ok) throw await responseError(res);
+  const blob = await res.blob();
+  if (seq !== previewSeq) return null;
+  const objectUrl = URL.createObjectURL(blob);
+  previewObjectUrls.push(objectUrl);
+  return objectUrl;
 }
 
 // Opens the preview dialog for a file. Download is always offered. Text is inserted with textContent
@@ -441,22 +552,42 @@ async function openPreview(file) {
   const seq = previewSeq;
   const controller = new AbortController();
   previewController = controller;
+  previewFile = file;
   els.previewTitle.textContent = file.name;
-  els.previewDownload.href = downloadUrl(file.key);
+  if (!auth.enabled) els.previewDownload.href = downloadUrl(file.key);
   els.previewDownload.setAttribute('aria-label', `Download ${file.name}`);
   els.preview.dataset.state = 'loading';
   setPreviewMessage('Loading preview…');
   if (!els.preview.open) els.preview.showModal();
+  let data;
   try {
-    const data = await api('GET', `/api/files/preview?key=${encodeURIComponent(file.key)}`, undefined, controller.signal);
+    data = await api('GET', `/api/files/preview?key=${encodeURIComponent(file.key)}`, undefined, controller.signal);
     if (seq !== previewSeq) return;
-    renderPreview(file, data, () => seq === previewSeq);
   } catch (err) {
     if (seq !== previewSeq || err.name === 'AbortError') return;
     // Shown in the dialog only: the folder's status line is not the preview's to change.
     setPreviewMessage(err.status === 404 ? 'This file no longer exists.' : err.message, true);
     els.preview.dataset.state = 'error';
+    return;
   }
+  // With login an <img>/<iframe> could not send the token, so same-origin content (a converted JPEG, memory/demo
+  // files) is fetched first; real S3's presigned URLs are used as they are.
+  if (auth.enabled && (data.kind === 'image' || data.kind === 'pdf') && isOwnApiUrl(data.url)) {
+    try {
+      const url = await authorizedObjectUrl(data.url, seq, controller.signal);
+      if (url === null || seq !== previewSeq) return;
+      data = { ...data, url };
+    } catch (err) {
+      if (seq !== previewSeq || err.name === 'AbortError') return;
+      setPreviewMessage(
+        data.kind === 'image' ? 'This image could not be displayed. Download it to open it in another app.' : err.message,
+        true,
+      );
+      els.preview.dataset.state = 'error';
+      return;
+    }
+  }
+  renderPreview(file, data, () => seq === previewSeq);
 }
 
 // `data` is the API's { kind, text?, truncated?, url? }. Image and PDF URLs come from the server (same
@@ -514,6 +645,7 @@ els.uploadInput.addEventListener('change', uploadFiles);
 els.newFolderForm.addEventListener('submit', createFolder);
 els.sort.addEventListener('change', renderListing);
 window.addEventListener('hashchange', () => {
+  if (!auth.signedIn) return; // the chooser is shown; there is no folder to load
   navSeq += 1;
   closePreview(); // a preview belongs to the folder it was opened in (also the phone's back button)
   const dropped = pendingReports;
@@ -522,4 +654,34 @@ window.addEventListener('hashchange', () => {
   // Possible data loss must not go unreported, but the new folder's status isn't ours to change.
   for (const report of dropped) if (report.isError) alert(report.text);
 });
-load();
+
+// With login: when the session ends (401, token expiry, sign-out) every file detail leaves the page, and every
+// request still in flight becomes stale (the same sequence numbers and navigation token that D13/D16/D24 use),
+// so a late response can't bring anything back. Uploads in flight are aborted and later files are not sent.
+function clearPrivateState() {
+  navSeq += 1;
+  loadSeq += 1;
+  loadController?.abort();
+  loadController = null;
+  closePreview();
+  pendingReports = [];
+  for (const xhr of activeUploads) xhr.abort();
+  activeUploads.clear();
+  for (const url of [...downloadObjectUrls]) revokeDownloadUrl(url);
+  current = { prefix: '', folders: [], files: [] };
+  els.breadcrumbs.replaceChildren();
+  els.listing.replaceChildren();
+  els.uploads.replaceChildren();
+  els.newFolderName.value = '';
+  setUploadEnabled(false);
+  setStatus('');
+}
+
+// With login (AUTH_MODE=cognito) the folder loads only once signed in; without it, at once as in v1.
+try {
+  const mayLoad = await startAuth(clearPrivateState);
+  if (auth.enabled) useAuthorizedPreviewDownload();
+  if (mayLoad) load();
+} catch (err) {
+  setStatus(err.message, true);
+}

@@ -37,6 +37,18 @@ body {
   border-bottom: 1px solid var(--border);
 }
 .topbar h1 { margin: 0; font-size: 1.15rem; }
+.topbar:has(.account:not([hidden])) { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; justify-content: space-between; }
+.account { display: flex; gap: 8px; align-items: center; color: var(--muted); }
+
+/* Login chooser (AUTH_MODE=cognito). */
+.login { max-width: 420px; margin: 0 auto; padding: 24px 16px; }
+.login h2 { margin: 0 0 12px; font-size: 1.1rem; }
+.login-methods { display: flex; flex-direction: column; gap: 12px; }
+.login-methods button { width: 100%; }
+.login-message { margin: 0 0 12px; color: var(--danger); }
+.login-message:empty { display: none; }
+.login-note { color: var(--muted); font-size: 0.875rem; }
+[hidden] { display: none !important; }
 
 main { max-width: 900px; margin: 0 auto; padding: 12px 16px 48px; }
 

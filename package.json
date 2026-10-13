@@ -15,8 +15,10 @@
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1147.0",
     "@aws-sdk/s3-request-presigner": "^3.1147.0",
+    "aws-jwt-verify": "5.2.1",
     "busboy": "^1.6.0",
     "express": "^5.2.1",
+    "oidc-client-ts": "3.5.0",
     "sharp": "^0.35.5"
   }
 }

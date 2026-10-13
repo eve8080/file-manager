@@ -15,7 +15,7 @@ If code and these documents disagree, stop and ask rather than silently picking 
 - Node.js (>= 22.9) + Express 5, ES modules, plain JavaScript, no build step; `sharp` (D25) converts JPEG previews
 - `src/server.js` — entry point (real S3); `src/demo.js` — in-memory demo, no AWS
 - `src/start.js` — `start(storage, config, label)`: builds the app (incl. `MAX_UPLOAD_MB`) for both entry points and listens
-- `src/app.js` — Express app factory `createApp({ storage, maxUploadBytes })`: API routes, host guard (D9),
+- `src/app.js` — Express app factory `createApp({ storage, maxUploadBytes, auth })`: API routes, host guard (D9/D26),
   cross-site write guard `sameOriginWrites` (D21), preview metadata/content routes (D24), security headers,
   error handler, upload result reporting
 - `src/upload.js` — streams multipart uploads (busboy) into `storage.putFile`; per-file and per-request limits (D22),
@@ -26,6 +26,8 @@ If code and these documents disagree, stop and ask rather than silently picking 
   `PREVIEW_FAILED`, raw error only logged) and `createLimiter` (at most 2 conversions at once) (D25)
 - `src/disposition.js` — safe `Content-Disposition` headers for attachment downloads and inline previews
 - `src/config.js` — reads env (`.env` loaded via `node --env-file-if-exists`)
+- `src/auth.js` — optional Cognito access-token validation through `aws-jwt-verify`; exact owner-sub/approved-client
+  authorization and agent read/write/delete scopes. Public auth configuration contains no credentials.
 - `src/paths.js` — validates/normalises every folder path; file keys are validated exactly (`parseFileKey`)
 - `src/errors.js` — `AppError` (status + code + optional details); API errors are `{ "error": { "code", "message", "details"? } }`;
   `toPublicError()` turns any error into its client-facing form
@@ -36,7 +38,10 @@ If code and these documents disagree, stop and ask rather than silently picking 
   presigning) and the content route calls `readPreviewSource(key, MAX_UPLOAD_MB)` (S3: one unranged GET, size-checked from the
   headers and while reading) then `normalizeJpeg`; originals are never rewritten and no derivative is stored.
   Uploads/moves never overwrite (`FILE_EXISTS`) or collide with folder names (`NAME_CONFLICT`, D23)
-- `public/` — static single page (vanilla JS); talks only to `/api/*`. Uploads use one XHR per file (per-file progress)
+- `public/` — static single page (vanilla JS); private file requests use `/api/*`. Uploads use one XHR per file.
+  `public/auth.js` uses the pinned same-origin `oidc-client-ts` browser artifact for selectable Google/native Cognito
+  login. Tokens stay in memory; only login-transaction state may use sessionStorage. Never use a CDN or expose tokens
+  in URLs. Session end must clear privileged UI and invalidate late responses; revoke owned blob URLs.
 - `test/` — `node --test`; contract tests run against memory storage AND s3 storage with a fake S3 client;
   `test/browser.test.js` drives the UI in headless Chrome (`test/helpers/chrome.js`, no dependencies);
   `test/jpeg-preview.test.js` covers the converter on synthetic P3/EXIF/MPF/gain-map JPEGs (`test/helpers/jpeg-fixtures.js`;
@@ -47,7 +52,10 @@ If code and these documents disagree, stop and ask rather than silently picking 
 - `npm install` — install dependencies
 - `npm start` — run against the real bucket (needs `.env`)
 - `npm run demo` — run with in-memory sample data (no AWS)
-- `npm test` — run all tests, including browser tests (never touches AWS). Browser tests are skipped if no
+- `npm test` — run all tests, including offline browser/JWKS/OIDC tests. Never intentionally contact real AWS.
+  Test isolation must remain safe when production code is broken: child SDK environments use synthetic credentials,
+  disabled metadata, null AWS config paths and loopback endpoints; never load the user's `.env` or `~/.aws`.
+  Browser tests are skipped if no
   Chrome is found (`CHROME_PATH` overrides); a skip is not a pass
 
 ## Coding rules
@@ -72,8 +80,14 @@ If code and these documents disagree, stop and ask rather than silently picking 
 - Never access, request, display, or store credentials. AWS credentials come from the SDK default
   chain (AWS profile / env) configured by Mr. So
 - No secrets in source, docs, tests, or logs. `.env` is git-ignored; only `.env.example` is committed
-- The app has NO login. Default bind is `127.0.0.1`; LAN use is opt-in via `HOST=0.0.0.0`.
-  Never expose it to the internet. A host-header guard blocks DNS-rebinding (only IP literals / `localhost` accepted)
+- With `AUTH_MODE` unset, the app preserves unauthenticated local v1: default `127.0.0.1`, opt-in LAN
+  `HOST=0.0.0.0`, IP/localhost host guard. Never expose that mode to the internet.
+- `AUTH_MODE=cognito` is the approved Phase A local-only login implementation (D26): exact configured loopback
+  origin/host, JWT in `X-App-Authorization`, owner-sub/approved-client allowlists and route scopes. Missing/invalid
+  login settings fail closed; public/cloud markers must not silently select unauthenticated mode.
+- Only Phase A local implementation/tests and the two named login libraries are approved. Do not create or configure
+  Cognito/Google accounts, perform real-S3 acceptance, add Phase B uploads/Lambda packaging, or deploy without separate
+  authorization. Mock-provider tests do not close real-provider, corporate-network or physical-phone acceptance.
 - Never create or modify AWS resources (buckets, IAM, policies)
 
 ## Git / release rules

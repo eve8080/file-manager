@@ -220,6 +220,20 @@ export class FakeS3Client {
   }
 }
 
+// Test-process isolation: a real S3Client (TEST_SIGNER below) resolves endpoint and client settings, which the SDK
+// may read from the shared AWS config/credential files the environment points to, or from a profile. Every test
+// process that builds S3 clients imports this module, so it cuts those sources off here: no config/credential files,
+// no profile, no instance metadata, no container/web-identity credentials, no configured endpoint. HOME and the
+// default S3 endpoint stay as they are (presigned test URLs keep their real shape; Chrome is unaffected).
+process.env.AWS_CONFIG_FILE = '/dev/null';
+process.env.AWS_SHARED_CREDENTIALS_FILE = '/dev/null';
+process.env.AWS_EC2_METADATA_DISABLED = 'true';
+for (const name of Object.keys(process.env)) {
+  if (/^AWS_(PROFILE|DEFAULT_PROFILE|ROLE_ARN|ROLE_SESSION_NAME|WEB_IDENTITY_TOKEN_FILE|CONTAINER_.*|SSO_.*|ENDPOINT_URL.*|IGNORE_CONFIGURED_ENDPOINT_URLS)$/.test(name)) {
+    delete process.env[name];
+  }
+}
+
 // A real S3Client used only for presigning, which is local computation. Its request handler throws, so any
 // attempt to send a request fails the test instead of reaching AWS. The credentials are dummies, not secrets.
 export const TEST_SIGNER = new S3Client({

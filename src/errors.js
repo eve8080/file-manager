@@ -94,6 +94,18 @@ export function toPublicError(err) {
   return { status: 500, code: 'INTERNAL_ERROR', message: 'Internal server error' };
 }
 
+// ---- Login (AUTH_MODE=cognito) ----
+// 401: no usable credentials (the client should sign in again). 403: a verified identity or client that may not
+// do this. 503: the token could not be checked (JWKS unreachable). Fixed messages; token details are never echoed.
+export const authRequired = () =>
+  new AppError(401, 'AUTH_REQUIRED', 'Sign in first: send the access token as "X-App-Authorization: Bearer <token>".');
+export const invalidToken = () => new AppError(401, 'INVALID_TOKEN', 'The access token is invalid or has expired. Sign in again.');
+export const notAuthorized = () => new AppError(403, 'NOT_AUTHORIZED', 'This account is not allowed to use this file manager.');
+export const insufficientScope = (scope) =>
+  new AppError(403, 'INSUFFICIENT_SCOPE', `This client is not allowed to ${scope} files (missing the "${scope}" scope).`);
+export const authUnavailable = () =>
+  new AppError(503, 'AUTH_UNAVAILABLE', 'The sign-in service could not be reached to check the access token. Try again shortly.');
+
 // JPEG previews are converted by the app (src/jpeg-preview.js). Fixed messages: no decoder or S3 detail reaches a client.
 export const previewFailed = () =>
   new AppError(422, 'PREVIEW_FAILED', 'This image could not be converted for preview. Download it to open it in another app.');

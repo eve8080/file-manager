@@ -10,7 +10,21 @@
 <body>
   <header class="topbar">
     <h1>File Manager</h1>
+    <div id="account" class="account" hidden>
+      <span>Signed in</span>
+      <button id="sign-out" type="button">Sign out</button>
+    </div>
   </header>
+  <!-- Shown only when the server requires login (AUTH_MODE=cognito); see auth.js. -->
+  <section id="login" class="login" aria-labelledby="login-title" hidden>
+    <h2 id="login-title">Sign in</h2>
+    <p id="login-message" class="login-message" role="alert"></p>
+    <div class="login-methods">
+      <button id="login-google" type="button">Continue with Google</button>
+      <button id="login-email" type="button">Email + password</button>
+    </div>
+    <p class="login-note">If Google is blocked on this network, use Email + password.</p>
+  </section>
   <main>
     <nav id="breadcrumbs" class="breadcrumbs" aria-label="Folder path"></nav>
 
